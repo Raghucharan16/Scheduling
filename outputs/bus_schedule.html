@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Bus Schedule Dashboard</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+        
+        /* Header Stats */
+        .stats-header {
+            background: rgba(255, 255, 255, 0.95);
+            border-radius: 15px;
+            padding: 20px;
+            margin-bottom: 20px;
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 20px;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);
+        }
+        
+        .stat-item {
+            text-align: center;
+        }
+        
+        .stat-label {
+            font-size: 14px;
+            color: #666;
+            margin-bottom: 5px;
+            font-weight: 500;
+        }
+        
+        .stat-value {
+            font-size: 24px;
+            font-weight: bold;
+            color: #333;
+        }
+        
+        /* Days Grid */
+        .days-grid {
+            display: grid;
+            grid-template-columns: repeat(7, 1fr);
+            gap: 15px;
+        }
+        
+        .day-column {
+            background: rgba(255, 255, 255, 0.95);
+            border-radius: 12px;
+            overflow: hidden;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.1);
+        }
+        
+        .day-header {
+            background: #333;
+            color: white;
+            text-align: center;
+            padding: 12px 8px;
+            font-weight: bold;
+            font-size: 14px;
+        }
+        
+        .routes-container {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+        }
+        
+        .route-column {
+            min-height: 400px;
+        }
+        
+        .route-header {
+            background: #f8f9fa;
+            text-align: center;
+            padding: 8px 4px;
+            font-weight: bold;
+            font-size: 12px;
+            color: #333;
+            border-bottom: 1px solid #dee2e6;
+        }
+        
+        .trip-item {
+            padding: 8px;
+            margin: 4px;
+            border-radius: 6px;
+            font-size: 11px;
+            line-height: 1.3;
+        }
+        
+        /* Trip colors similar to the image */
+        .trip-red {
+            background: #ff6b6b;
+            color: white;
+        }
+        
+        .trip-orange {
+            background: #ffa726;
+            color: white;
+        }
+        
+        .trip-yellow {
+            background: #ffeb3b;
+            color: #333;
+        }
+        
+        .trip-green {
+            background: #66bb6a;
+            color: white;
+        }
+        
+        .trip-blue {
+            background: #42a5f5;
+            color: white;
+        }
+        
+        .trip-purple {
+            background: #ab47bc;
+            color: white;
+        }
+        
+        .trip-teal {
+            background: #26c6da;
+            color: white;
+        }
+        
+        .trip-indigo {
+            background: #5c6bc0;
+            color: white;
+        }
+        
+        .bus-number {
+            font-weight: bold;
+            font-size: 12px;
+        }
+        
+        .trip-time {
+            font-size: 10px;
+            opacity: 0.9;
+        }
+        
+        .trip-epk {
+            font-size: 10px;
+            opacity: 0.9;
+        }
+        
+        @media (max-width: 1200px) {
+            .days-grid {
+                grid-template-columns: repeat(4, 1fr);
+            }
+        }
+        
+        @media (max-width: 800px) {
+            .days-grid {
+                grid-template-columns: repeat(2, 1fr);
+            }
+            .stats-header {
+                grid-template-columns: repeat(2, 1fr);
+            }
+        }
+        
+        @media (max-width: 500px) {
+            .days-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <!-- Header Stats -->
+        <div class="stats-header">
+            <div class="stat-item">
+                <div class="stat-label">No. of Buses</div>
+                <div class="stat-value">0</div>
+            </div>
+            <div class="stat-item">
+                <div class="stat-label">EPK</div>
+                <div class="stat-value">0.00</div>
+            </div>
+            <div class="stat-item">
+                <div class="stat-label">Avg Distance/bus/day (km)</div>
+                <div class="stat-value">0</div>
+            </div>
+            <div class="stat-item">
+                <div class="stat-label">Avg Trip Time</div>
+                <div class="stat-value">0h 0m</div>
+            </div>
+        </div>
+        
+        <!-- Days Grid -->
+        <div class="days-grid">
+            <div class="day-column">
+                <div class="day-header">Monday</div>
+                <div class="routes-container">
+                    <!-- H → V (A-B) -->
+                    <div class="route-column">
+                        <div class="route-header">H → V</div>
+                    </div>
+                    
+                    <!-- V → H (B-A) -->
+                    <div class="route-column">
+                        <div class="route-header">V → H</div>
+                    </div>
+                </div>
+            </div>
+            <div class="day-column">
+                <div class="day-header">Tuesday</div>
+                <div class="routes-container">
+                    <!-- H → V (A-B) -->
+                    <div class="route-column">
+                        <div class="route-header">H → V</div>
+                    </div>
+                    
+                    <!-- V → H (B-A) -->
+                    <div class="route-column">
+                        <div class="route-header">V → H</div>
+                    </div>
+                </div>
+            </div>
+            <div class="day-column">
+                <div class="day-header">Wednesday</div>
+                <div class="routes-container">
+                    <!-- H → V (A-B) -->
+                    <div class="route-column">
+                        <div class="route-header">H → V</div>
+                    </div>
+                    
+                    <!-- V → H (B-A) -->
+                    <div class="route-column">
+                        <div class="route-header">V → H</div>
+                    </div>
+                </div>
+            </div>
+            <div class="day-column">
+                <div class="day-header">Thursday</div>
+                <div class="routes-container">
+                    <!-- H → V (A-B) -->
+                    <div class="route-column">
+                        <div class="route-header">H → V</div>
+                    </div>
+                    
+                    <!-- V → H (B-A) -->
+                    <div class="route-column">
+                        <div class="route-header">V → H</div>
+                    </div>
+                </div>
+            </div>
+            <div class="day-column">
+                <div class="day-header">Friday</div>
+                <div class="routes-container">
+                    <!-- H → V (A-B) -->
+                    <div class="route-column">
+                        <div class="route-header">H → V</div>
+                    </div>
+                    
+                    <!-- V → H (B-A) -->
+                    <div class="route-column">
+                        <div class="route-header">V → H</div>
+                    </div>
+                </div>
+            </div>
+            <div class="day-column">
+                <div class="day-header">Saturday</div>
+                <div class="routes-container">
+                    <!-- H → V (A-B) -->
+                    <div class="route-column">
+                        <div class="route-header">H → V</div>
+                    </div>
+                    
+                    <!-- V → H (B-A) -->
+                    <div class="route-column">
+                        <div class="route-header">V → H</div>
+                    </div>
+                </div>
+            </div>
+            <div class="day-column">
+                <div class="day-header">Sunday</div>
+                <div class="routes-container">
+                    <!-- H → V (A-B) -->
+                    <div class="route-column">
+                        <div class="route-header">H → V</div>
+                    </div>
+                    
+                    <!-- V → H (B-A) -->
+                    <div class="route-column">
+                        <div class="route-header">V → H</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</body>
+</html>

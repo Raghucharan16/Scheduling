@@ -1,0 +1,5 @@
+pandas>=2.0.0
+numpy>=1.24.0
+ortools>=9.7.0
+matplotlib>=3.6.0 
+click

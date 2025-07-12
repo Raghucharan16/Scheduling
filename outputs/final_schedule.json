@@ -1,0 +1,44 @@
+{
+  "Monday": {
+    "assignments": [],
+    "feasible": true,
+    "totalTrips": 0,
+    "totalRevenue": 0
+  },
+  "Tuesday": {
+    "assignments": [],
+    "feasible": true,
+    "totalTrips": 0,
+    "totalRevenue": 0
+  },
+  "Wednesday": {
+    "assignments": [],
+    "feasible": true,
+    "totalTrips": 0,
+    "totalRevenue": 0
+  },
+  "Thursday": {
+    "assignments": [],
+    "feasible": true,
+    "totalTrips": 0,
+    "totalRevenue": 0
+  },
+  "Friday": {
+    "assignments": [],
+    "feasible": true,
+    "totalTrips": 0,
+    "totalRevenue": 0
+  },
+  "Saturday": {
+    "assignments": [],
+    "feasible": true,
+    "totalTrips": 0,
+    "totalRevenue": 0
+  },
+  "Sunday": {
+    "assignments": [],
+    "feasible": true,
+    "totalTrips": 0,
+    "totalRevenue": 0
+  }
+}

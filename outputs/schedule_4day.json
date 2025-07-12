@@ -1,0 +1,190 @@
+{
+  "0": [
+    {
+      "bus": 4,
+      "id": 7,
+      "day": 0,
+      "start": 210,
+      "origin": "A",
+      "route": "A-B",
+      "epk": 66.93
+    },
+    {
+      "bus": 4,
+      "id": 581,
+      "day": 0,
+      "start": 1410,
+      "origin": "B",
+      "route": "B-A",
+      "epk": 111.56
+    }
+  ],
+  "1": [
+    {
+      "bus": 6,
+      "id": 8,
+      "day": 1,
+      "start": 210,
+      "origin": "A",
+      "route": "A-B",
+      "epk": 51.32
+    },
+    {
+      "bus": 6,
+      "id": 582,
+      "day": 1,
+      "start": 1410,
+      "origin": "B",
+      "route": "B-A",
+      "epk": 110.41
+    }
+  ],
+  "2": [
+    {
+      "bus": 3,
+      "id": 429,
+      "day": 2,
+      "start": 750,
+      "origin": "B",
+      "route": "B-A",
+      "epk": 64.43
+    },
+    {
+      "bus": 3,
+      "id": 289,
+      "day": 2,
+      "start": 1410,
+      "origin": "A",
+      "route": "A-B",
+      "epk": 116.45
+    },
+    {
+      "bus": 9,
+      "id": 422,
+      "day": 2,
+      "start": 720,
+      "origin": "B",
+      "route": "B-A",
+      "epk": 62.34
+    },
+    {
+      "bus": 9,
+      "id": 282,
+      "day": 2,
+      "start": 1380,
+      "origin": "A",
+      "route": "A-B",
+      "epk": 113.35
+    }
+  ],
+  "3": [
+    {
+      "bus": 0,
+      "id": 409,
+      "day": 3,
+      "start": 660,
+      "origin": "B",
+      "route": "B-A",
+      "epk": 58.16
+    },
+    {
+      "bus": 0,
+      "id": 290,
+      "day": 3,
+      "start": 1410,
+      "origin": "A",
+      "route": "A-B",
+      "epk": 122.28
+    },
+    {
+      "bus": 1,
+      "id": 10,
+      "day": 3,
+      "start": 210,
+      "origin": "A",
+      "route": "A-B",
+      "epk": 68.25
+    },
+    {
+      "bus": 1,
+      "id": 577,
+      "day": 3,
+      "start": 1380,
+      "origin": "B",
+      "route": "B-A",
+      "epk": 108.32
+    },
+    {
+      "bus": 2,
+      "id": 423,
+      "day": 3,
+      "start": 720,
+      "origin": "B",
+      "route": "B-A",
+      "epk": 62.34
+    },
+    {
+      "bus": 2,
+      "id": 283,
+      "day": 3,
+      "start": 1380,
+      "origin": "A",
+      "route": "A-B",
+      "epk": 119.27
+    },
+    {
+      "bus": 5,
+      "id": 416,
+      "day": 3,
+      "start": 690,
+      "origin": "B",
+      "route": "B-A",
+      "epk": 60.25
+    },
+    {
+      "bus": 5,
+      "id": 276,
+      "day": 3,
+      "start": 1350,
+      "origin": "A",
+      "route": "A-B",
+      "epk": 116.26
+    },
+    {
+      "bus": 7,
+      "id": 24,
+      "day": 3,
+      "start": 270,
+      "origin": "A",
+      "route": "A-B",
+      "epk": 63.91
+    },
+    {
+      "bus": 7,
+      "id": 584,
+      "day": 3,
+      "start": 1410,
+      "origin": "B",
+      "route": "B-A",
+      "epk": 110.41
+    },
+    {
+      "bus": 8,
+      "id": 17,
+      "day": 3,
+      "start": 240,
+      "origin": "A",
+      "route": "A-B",
+      "epk": 68.25
+    },
+    {
+      "bus": 8,
+      "id": 570,
+      "day": 3,
+      "start": 1350,
+      "origin": "B",
+      "route": "B-A",
+      "epk": 106.23
+    }
+  ]
+}

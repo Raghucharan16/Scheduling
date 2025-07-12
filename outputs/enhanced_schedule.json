@@ -1,0 +1,31 @@
+{
+  "schedule": {
+    "0": [],
+    "1": [],
+    "2": [],
+    "3": [],
+    "4": [],
+    "5": [],
+    "6": []
+  },
+  "statistics": {
+    "total_trips": 0,
+    "total_revenue": 0,
+    "avg_epk": 0,
+    "night_trips": 0,
+    "premium_trips": 0,
+    "regular": {
+      "trips": 0,
+      "revenue": 0,
+      "avg_epk": 0,
+      "night_trips": 0
+    },
+    "peak": {
+      "trips": 0,
+      "revenue": 0,
+      "avg_epk": 0,
+      "night_trips": 0,
+      "premium_trips": 0
+    }
+  }
+}
