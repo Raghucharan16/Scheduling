@@ -18,7 +18,7 @@ class PeakCPSATSolver:
         self.bus_manager = bus_manager
         self.logger = logging.getLogger(__name__)
         
-    def solve_peak_phase(self, csv_path: str, end_states: List[Dict]) -> Dict:
+    def solve_peak_phase(self, csv_path: str, end_states: List[Dict], max_idle: float = None) -> Dict:
         """
         Solve peak phase (Fri-Sun) using pure OR-Tools CP-SAT
         
@@ -125,6 +125,22 @@ class PeakCPSATSolver:
 
         # ENFORCE GLOBAL BUS TRIP CHAINING
         global_bus_trip_chaining(model, x, viable_trips, B, travel_h, charge_h)
+
+        # ENFORCE MAX IDLE TIME CONSTRAINT
+        if max_idle is not None:
+            max_idle_minutes = int(max_idle * 60)
+            for b in range(B):
+                bus_trips = [t for t in viable_trips if (b, t["id"]) in x]
+                # Sort by global start time
+                bus_trips.sort(key=lambda t: t["day"] * 1440 + t["start"])
+                for i in range(len(bus_trips) - 1):
+                    t1 = bus_trips[i]
+                    t2 = bus_trips[i+1]
+                    t1_end = t1["day"] * 1440 + t1["start"] + cycle_minutes
+                    t2_start = t2["day"] * 1440 + t2["start"]
+                    idle_gap = t2_start - t1_end
+                    if idle_gap > max_idle_minutes:
+                        model.Add(x[b, t1["id"]] + x[b, t2["id"]] <= 1)
         
         # CONSTRAINT 6: Route continuity (relaxed for feasibility)
         # Similar to regular phase - only enforce for same-day consecutive trips

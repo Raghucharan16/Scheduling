@@ -7,7 +7,7 @@ Uses the new enhanced solvers with BusManager for better fleet management.
 """
 import json
 import os
-from integrator import CPSATIntegrator
+from src.integrator import CPSATIntegrator
 from src.schedule_visualizer import BusScheduleVisualizer
 
 def get_user_inputs():
@@ -38,13 +38,6 @@ def run_enhanced_scheduling():
     # Get configuration
     buses_a, buses_b, travel_h, charge_h, max_idle = get_user_inputs()
     
-    print(f"\n🔧 Enhanced Configuration:")
-    print(f"   Fleet Mapping:")
-    print(f"     • Buses 1-{buses_a}: Home depot A")
-    print(f"     • Buses {buses_a+1}-{buses_a+buses_b}: Home depot B")
-    print(f"   Cycle: {travel_h}h travel + {charge_h}h charge = {travel_h + charge_h}h")
-    print(f"   Max idle: {max_idle}h")
-    print(f"   Strategy: Two-phase optimization (Utilization + EPK)")
 
     try:
         print(f"\n🚀 Running Enhanced Two-Phase Scheduling...")
@@ -54,7 +47,8 @@ def run_enhanced_scheduling():
             buses_at_a=buses_a,
             buses_at_b=buses_b,
             travel_h=travel_h,
-            charge_h=charge_h
+            charge_h=charge_h,
+            max_idle=max_idle
         )
         
         # Run complete scheduling

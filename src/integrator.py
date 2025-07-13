@@ -14,10 +14,11 @@ import os
 class CPSATIntegrator:
     """Pure CP-SAT integration system"""
     
-    def __init__(self, buses_at_a: int, buses_at_b: int, travel_h: float, charge_h: float):
+    def __init__(self, buses_at_a: int, buses_at_b: int, travel_h: float, charge_h: float, max_idle: float):
         self.bus_manager = BusManager(buses_at_a, buses_at_b)
         self.bus_manager.travel_h = travel_h
         self.bus_manager.charge_h = charge_h
+        self.max_idle = max_idle
         
         self.regular_solver = RegularCPSATSolver(self.bus_manager)
         self.peak_solver = PeakCPSATSolver(self.bus_manager)
@@ -39,10 +40,10 @@ class CPSATIntegrator:
         print(f"   Strategy: Pure OR-Tools CP-SAT optimization (no heuristics)")
         
         # Phase 1: Regular scheduling (Mon-Thu) with utilization + night coverage
-        regular_schedule, end_states = self.regular_solver.solve_regular_phase(csv_path)
+        regular_schedule, end_states = self.regular_solver.solve_regular_phase(csv_path, self.max_idle)
         
         # Phase 2: Peak scheduling (Fri-Sun) with EPK + night optimization
-        peak_schedule = self.peak_solver.solve_peak_phase(csv_path, end_states)
+        peak_schedule = self.peak_solver.solve_peak_phase(csv_path, end_states, self.max_idle)
         
         # Combine results
         complete_schedule = {}
