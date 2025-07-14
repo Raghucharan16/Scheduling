@@ -1,146 +1,149 @@
-# problem_solver.py
-"""
-Greedy EV Bus Weekly Scheduler
-A fallback heuristic-based scheduler (no OR-Tools) that:
-  - Reads EPK data from CSV
-  - Assigns trips greedily by descending EPK
-  - Respects all hard constraints:
-      • Forbidden start slots (00:30–03:00)
-      • Each bus ≤2 trips/day
-      • After a trip, bus unavailable until travel+charge complete
-      • No overlapping trips on a bus
-      • Buses alternate A↔B
-      • No two departures from same station in same or adjacent slots
-  - Outputs schedule.json and schedule.html
-"""
-import pandas as pd
-import json
-from collections import defaultdict
+#!/usr/bin/env python3
+import csv, json
+from datetime import timedelta
+from ortools.sat.python import cp_model
 
-def load_epk(csv_path):
-    df = pd.read_csv(csv_path)
-    days = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
-    trips = []
-    for _, row in df.iterrows():
-        # parse time slot
-        h, m, _ = row['slot'].split(':')
-        start = int(h)*60 + int(m)
-        # skip forbidden slots
-        if start in {30,60,90,120,150,180}:
-            continue
-        for di,day in enumerate(days):
-            trips.append({
-                'day': di,
-                'start': start,
-                'route': row['route'],
-                'origin': row['route'][0],  # 'A' or 'B'
-                'epk': float(row[day])
-            })
+DAYS      = ["monday","tuesday","wednesday","thursday","friday","saturday","sunday"]
+FORBIDDEN = {30,60,90,120,150,180}
+
+def load_trips(csv_path, a1,b1,c1,a2,b2,c2):
+    trips=[]
+    idx=0
+    with open(csv_path) as f:
+        for row in csv.DictReader(f):
+            h,m,_ = row["slot"].split(":")
+            start = int(h)*60 + int(m)
+            if start in FORBIDDEN: continue
+            route  = row["route"]
+            origin = route[0]
+            if route=="X-Y":
+                cycle, mid_off = a1+b1+c1, a1
+            else:
+                cycle, mid_off = a2+b2+c2, a2
+            for d,day in enumerate(DAYS):
+                trips.append({
+                  "id":     idx,
+                  "day":    d,
+                  "start":  start,
+                  "origin": origin,
+                  "route":  route,
+                  "epk":    float(row[day]),
+                  "cycle":  cycle,
+                  "mid_off":mid_off
+                })
+                idx+=1
     return trips
 
+def hhmmss(mins):
+    td=timedelta(minutes=mins)
+    h=td.seconds//3600; m=(td.seconds%3600)//60; s=td.seconds%60
+    return f"{h:02d}:{m:02d}:{s:02d}"
 
-def greedy_schedule(trips, buses_A, buses_B,
-                    travel_time_h, charge_time_h,
-                    slot_gap_min=30):
-    # Initialize buses
-    total = buses_A + buses_B
-    # Each bus has: available_time, location ('A'/'B'), trips_today count per day
-    bus_state = [
-        {'avail':0, 'loc':('A' if i<buses_A else 'B'), 'last_depart':-999, 'daily_count':defaultdict(int)}
-        for i in range(total)
-    ]
-    duration = int((travel_time_h + charge_time_h)*60)
+def build_and_solve(trips,nX,nY,charge_depo):
+    B=nX+nY
+    model=cp_model.CpModel()
+    x, intervals = {}, {b:[] for b in range(B)}
 
-    # Prepare output: day->route->list of (bus, start, epk)
-    days = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
-    schedule = {d:{'A-B':[], 'B-A':[]} for d in days}
+    # Decision + interval vars
+    for b in range(B):
+      for t in trips:
+        lit = model.NewBoolVar(f"x[{b},{t['id']}]")
+        x[b,t["id"]] = lit
+        s = t["day"]*1440 + t["start"]
+        iv = model.NewOptionalIntervalVar(s, t["cycle"], s+t["cycle"], lit, f"iv[{b},{t['id']}]")
+        intervals[b].append(iv)
 
-    # Sort all trips by descending EPK globally
-    sorted_trips = sorted(trips, key=lambda x: -x['epk'])
+    # 1) each trip ≤1 bus
+    for t in trips:
+      model.Add(sum(x[b,t["id"]] for b in range(B)) <= 1)
 
-    # Track station/time occupancy (day, start) -> occupied
-    occupied = set()
+    # 2) no overlap per bus
+    for b in range(B):
+      model.AddNoOverlap(intervals[b])
 
-    for trip in sorted_trips:
-        day = trip['day']
-        start = trip['start']
-        key1 = (day, start, trip['origin'])
-        # also adjacent slots
-        adj_keys = {(day, start-slot_gap_min, trip['origin']), (day, start+slot_gap_min, trip['origin'])}
-        # try assign to some bus
-        for b in range(total):
-            st = bus_state[b]
-            # can only depart if at correct origin
-            if st['loc'] != trip['origin']:
-                continue
-            # bus must be available
-            global_start = day*24*60 + start
-            if st['avail'] > global_start:
-                continue
-            # daily count < 2
-            if st['daily_count'][day] >= 2:
-                continue
-            # no departure same or adjacent
-            if (day, start, trip['origin']) in occupied:
-                continue
-            if any((day, start+delta, trip['origin']) in occupied for delta in (-slot_gap_min, slot_gap_min)):
-                continue
-            # assign
-            schedule[days[day]][trip['route']].append((b, start, trip['epk']))
-            occupied.add(key1)
-            for k in adj_keys:
-                # prevent adjacent slot departure by marking occupied
-                occupied.add(k)
-            # update bus state
-            st['avail'] = global_start + duration
-            st['loc'] = 'B' if trip['origin']=='A' else 'A'
-            st['last_depart'] = start
-            st['daily_count'][day] += 1
-            break
+    # 3) no two departures same origin/time
+    for d in range(7):
+      for orig in ("X","Y"):
+        for s in {t["start"] for t in trips if t["day"]==d and t["origin"]==orig}:
+          ids=[t["id"] for t in trips if t["day"]==d and t["start"]==s and t["origin"]==orig]
+          model.Add(sum(x[b,i] for b in range(B) for i in ids) <=1)
 
-    return schedule
+    # 4) ≤2 trips/day
+    for b in range(B):
+      for d in range(7):
+        day_ids=[t["id"] for t in trips if t["day"]==d]
+        model.Add(sum(x[b,i] for i in day_ids) <= 2)
 
+    # 5) depot chaining
+    for b in range(B):
+      home = "X" if b<nX else "Y"
+      for t in trips:
+        if t["origin"]!=home:
+          earlier=[u for u in trips if (u["day"]<t["day"]) or (u["day"]==t["day"] and u["start"]<t["start"])]
+          if not any((b,u["id"]) in x for u in earlier):
+            model.Add(x[b,t["id"]]==0)
 
-def write_outputs(schedule):
-    # JSON
-    out = []
-    for day,routes in schedule.items():
-        for route, trips in routes.items():
-            for b,start,epk in trips:
-                out.append({'day':day,'route':route,'bus':b,
-                            'start':f"{start//60:02d}:{start%60:02d}",
-                            'epk':epk})
-    with open('schedule.json','w') as f:
-        json.dump(out, f, indent=2)
-    # HTML
-    days = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
-    html = ['<html><head><style>table{border-collapse:collapse;}td,th{border:1px solid#999;padding:5px;} .slot{margin:2px 0;}</style></head><body>']
-    html.append('<h1>Weekly Schedule</h1><table><tr><th>Day</th><th>A→B</th><th>B→A</th></tr>')
-    for day in days:
-        html.append(f'<tr><td><b>{day}</b></td>')
-        for route in ['A-B','B-A']:
-            cell = ''
-            for b,start,epk in schedule[day][route]:
-                tstr = f"{start//60:02d}:{start%60:02d}"
-                cell += f"<div class='slot'>Bus {b}@{tstr} (EPK={epk:.2f})</div>"
-            html.append(f'<td>{cell}</td>')
-        html.append('</tr>')
-    html.append('</table></body></html>')
-    with open('schedule.html','w') as f:
-        f.write('\n'.join(html))
+    # 6) continuity + time-gating
+    for b in range(B):
+      for t1 in trips:
+        if (b,t1["id"]) not in x: continue
+        g1   = t1["day"]*1440 + t1["start"]
+        end1 = g1 + t1["cycle"] + int(charge_depo*60)
+        dest = "Y" if t1["origin"]=="X" else "X"
+        for t2 in trips:
+          if (b,t2["id"]) not in x: continue
+          g2 = t2["day"]*1440 + t2["start"]
+          if g2 <= g1: continue
+          if t2["origin"]!=dest:
+            model.Add(x[b,t1["id"]] + x[b,t2["id"]] <= 1)
+          if g2 < end1:
+            model.Add(x[b,t1["id"]] + x[b,t2["id"]] <= 1)
 
+    # 7) objective: maximize trips then epk
+    trip_count = sum(x[b,t["id"]] for b in range(B) for t in trips)
+    max_epk100  = max(int(t["epk"]*100) for t in trips)
+    W           = max_epk100*B*len(trips) + 1
+    epk_terms   = sum(int(t["epk"]*100)*x[b,t["id"]] for b in range(B) for t in trips)
+    model.Maximize(W*trip_count + epk_terms)
 
-def main():
-    csv_path = input("EPK CSV path: ")
-    buses_A = int(input("Number of buses at A: "))
-    buses_B = int(input("Number of buses at B: "))
-    tt = float(input("Travel time (h): "))
-    ct = float(input("Charge time (h): "))
+    solver=cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds=60
+    solver.parameters.num_search_workers=8
+    status=solver.Solve(model)
+    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+      print("❌ No feasible schedule!")
+      return None
 
-    trips = load_epk(csv_path)
-    schedule = greedy_schedule(trips, buses_A, buses_B, tt, ct)
-    write_outputs(schedule)
-    print("Done: schedule.json and schedule.html generated.")
+    out={day:{"assignments":[],"feasible":True} for day in DAYS}
+    for b in range(B):
+      chosen=[t for t in trips if solver.Value(x[b,t["id"]])]
+      chosen.sort(key=lambda u:(u["day"],u["start"]))
+      for t in chosen:
+        out[DAYS[t["day"]]]["assignments"].append({
+          "busNumber": b+1,
+          "dayIndex":  t["day"],
+          "dayName":   DAYS[t["day"]],
+          "trip":{
+            "route":      t["route"],
+            "startTime":  hhmmss(t["start"]),
+            "midPointTime": hhmmss(t["start"]+t["mid_off"]),
+            "endTime":    hhmmss(t["start"]+t["cycle"]),
+            "epk":        round(t["epk"],2)
+          }
+        })
+    return out
 
-if __name__=='__main__':
-    main()
+if __name__=="__main__":
+    csv_path    = "epk_data.csv"
+    nX          = int(input("Buses at X: "))
+    nY          = int(input("Buses at Y: "))
+    a1,b1,c1    = map(float,input("X→M travel, charge; M→Y travel (h): ").split())
+    a2,b2,c2    = map(float,input("Y→M travel, charge; M→X travel (h): ").split())
+    charge_depo = float(input("Depot charge (h): "))
+    trips = load_trips(csv_path,int(a1*60),int(b1*60),int(c1*60),
+                               int(a2*60),int(b2*60),int(c2*60))
+    sched = build_and_solve(trips,nX,nY,charge_depo)
+    if sched:
+      with open("schedule.json","w") as f:
+        json.dump({"schedule":sched},f,indent=2)
+      print("✅ schedule.json written.")
