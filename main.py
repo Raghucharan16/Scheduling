@@ -265,7 +265,7 @@ def main():
     buses_b  = ask_int("Number of buses at Station B", 5)
     travel_h = ask_int("Travel time (hours) X→Y or Y→X", 9)
     charge_h = ask_int("Depot charge time (hours)", 2)
-    max_idle_h = ask_int("Max *extra* idle allowed (hours)", 4)
+    max_idle_h = ask_int("Max *extra* idle allowed (hours)", 2)
     json_out = ask_str("JSON output file", "schedule.json")
     html_out = ask_str("HTML output file", "schedule.html")
 
