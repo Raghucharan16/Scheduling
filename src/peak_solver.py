@@ -1,284 +1,227 @@
 #!/usr/bin/env python3
 """
-Pure OR-Tools CP-SAT Peak Phase Solver (Friday-Sunday)
-Focus: EPK OPTIMIZATION + PREMIUM NIGHT COVERAGE with day continuity
+peak_solver.py  –  Optimise Fri–Sun schedule given Thu & Mon anchoring.
+
+Assumptions
+-----------
+* Your steady JSON (from the previous solver) has numeric day labels:
+  "1" … "7"   (1=Mon, 4=Thu, 5=Fri, 7=Sun).
+* Exactly two symmetric routes appear in the EPK CSV, e.g. 'H-V' and 'V-H'.
+* Travel‑time + charge‑time ≤ 12 h so at most two departures per bus per day.
 """
 
-from typing import Dict, List, Tuple, Optional
+from pathlib import Path
+import json, sys
+import pandas as pd
 from ortools.sat.python import cp_model
-from .bus_manager import BusManager
-from .loader import load_trips
-import logging
-from .constraints import global_bus_trip_chaining
+from jinja2 import Template
 
-class PeakCPSATSolver:
-    """Pure OR-Tools CP-SAT solver for peak phase scheduling"""
-    
-    def __init__(self, bus_manager: BusManager):
-        self.bus_manager = bus_manager
-        self.logger = logging.getLogger(__name__)
-        
-    def solve_peak_phase(self, csv_path: str, end_states: List[Dict], max_idle: float = None) -> Dict:
-        """
-        Solve peak phase (Fri-Sun) using pure OR-Tools CP-SAT
-        
-        Returns:
-            schedule_dict
-        """
-        print(f"\n🚀 PURE CP-SAT PEAK SOLVER (Fri-Sun)")
-        print(f"   Strategy: OR-Tools CP-SAT with EPK optimization + night coverage")
-        print(f"   Target: 18+ trips per day with premium EPK focus")
-        
-        # Apply end states from regular phase
-        self.bus_manager.reset_for_phase(end_states)
-        
-        # Load and filter trips
-        all_trips = load_trips(csv_path)
-        peak_trips = [t for t in all_trips if 4 <= t["day"] <= 6]
-        
-        # Categorize trips by quality
-        premium_trips = [t for t in peak_trips if t["epk"] >= 95.0]  # Premium
-        night_premium = [t for t in peak_trips if t["epk"] >= 85.0 and 
-                        (t["start"] >= 1320 or t["start"] <= 240)]  # Night premium
-        good_trips = [t for t in peak_trips if t["epk"] >= 70.0]   # Good quality
-        
-        # Combine with priority: premium > night premium > good
-        # Use dict to avoid duplicates since trips are dictionaries
-        trip_dict = {}
-        for t in premium_trips + night_premium + good_trips:
-            trip_dict[t["id"]] = t
-        viable_trips = list(trip_dict.values())
-        
-        print(f"   Available trips: {len(viable_trips)} total")
-        print(f"     Premium (≥₹95): {len(premium_trips)} trips")
-        print(f"     Night Premium (≥₹85, night): {len(night_premium)} trips")
-        print(f"     Good (≥₹40): {len(good_trips)} trips")
-        
-        # Create CP-SAT model
-        model = cp_model.CpModel()
-        
-        # Parameters
-        B = self.bus_manager.total_buses
-        # buses_a = self.bus_manager.buses_at_a
-        travel_h = self.bus_manager.travel_h
-        charge_h = self.bus_manager.charge_h
-        cycle_minutes = int((travel_h + charge_h) * 60)
-        
-        # Decision variables: x[bus_idx, trip_id] = 1 if bus does trip
-        x = {}
-        for b in range(B):
-            for t in viable_trips:
-                x[b, t["id"]] = model.NewBoolVar(f"x[{b},{t['id']}]")
-        
-        # CONSTRAINT 1: No overlapping trips for same bus
-        for b in range(B):
-            intervals = []
-            for t in viable_trips:
-                start_time = t["day"] * 1440 + t["start"]
-                end_time = start_time + cycle_minutes
-                interval = model.NewOptionalIntervalVar(
-                    start_time, cycle_minutes, end_time,
-                    x[b, t["id"]], f"interval[{b},{t['id']}]"
-                )
-                intervals.append(interval)
-            model.AddNoOverlap(intervals)
-        
-        # CONSTRAINT 2: Max 2 trips per day per bus
-        for b in range(B):
-            for day in range(4, 7):  # Days 4-6
-                day_trips = [t["id"] for t in viable_trips if t["day"] == day]
-                model.Add(sum(x[b, tid] for tid in day_trips) <= 2)
-        
-        # CONSTRAINT 3: Max 1 trip per direction per day per bus
-        for b in range(B):
-            for day in range(4, 7):
-                ab_trips = [t["id"] for t in viable_trips if t["day"] == day and t["route"] == "A-B"]
-                ba_trips = [t["id"] for t in viable_trips if t["day"] == day and t["route"] == "B-A"]
-                
-                if ab_trips:
-                    model.Add(sum(x[b, tid] for tid in ab_trips) <= 1)
-                if ba_trips:
-                    model.Add(sum(x[b, tid] for tid in ba_trips) <= 1)
-        
-        # CONSTRAINT 4: No two buses same origin/time
-        for day in range(4, 7):
-            times = set(t["start"] for t in viable_trips if t["day"] == day)
-            for time in times:
-                for origin in ["A", "B"]:
-                    trip_ids = [t["id"] for t in viable_trips 
-                              if t["day"] == day and t["start"] == time and t["origin"] == origin]
-                    if trip_ids:
-                        model.Add(sum(x[b, tid] for b in range(B) for tid in trip_ids) <= 1)
-        
-        # CONSTRAINT 5: Cross-day continuity 
-        for b in range(B):
-            for t1 in viable_trips:
-                end1 = t1["day"] * 1440 + t1["start"] + cycle_minutes
-                next_day = t1["day"] + 1
-                
-                for t2 in viable_trips:
-                    if t2["day"] == next_day:
-                        start2 = t2["day"] * 1440 + t2["start"]
-                        if start2 < end1:
-                            # t2 starts before t1 finishes - forbid both
-                            model.Add(x[b, t1["id"]] + x[b, t2["id"]] <= 1)
+# -----------------  CONFIGURABLE CONSTANTS  -----------------
+FORBIDDEN  = {1,2,3,4,5,6}           # 00:30‑03:00 start slots
+SLOTS_PER  = 48                      # 30‑min granularity
+ALLOWED    = [s for s in range(SLOTS_PER) if s not in FORBIDDEN]
 
-        # ENFORCE GLOBAL BUS TRIP CHAINING
-        global_bus_trip_chaining(model, x, viable_trips, B, travel_h, charge_h)
+PEAK_DAYS  = ["5","6","7"]           # Fri, Sat, Sun
+NIGHT_SLOTS= {s for s in ALLOWED if 38 <= s <= 47}      # 19:00‑23:30
+EPK_THRESH = 90.0                    # high‑EPK threshold
+UTIL_FLOOR = 0.95                    # ≥95 % of max trips
 
-        # ENFORCE MAX IDLE TIME CONSTRAINT
-        if max_idle is not None:
-            max_idle_minutes = int(max_idle * 60)
-            for b in range(B):
-                bus_trips = [t for t in viable_trips if (b, t["id"]) in x]
-                # Sort by global start time
-                bus_trips.sort(key=lambda t: t["day"] * 1440 + t["start"])
-                for i in range(len(bus_trips) - 1):
-                    t1 = bus_trips[i]
-                    t2 = bus_trips[i+1]
-                    t1_end = t1["day"] * 1440 + t1["start"] + cycle_minutes
-                    t2_start = t2["day"] * 1440 + t2["start"]
-                    idle_gap = t2_start - t1_end
-                    if idle_gap > max_idle_minutes:
-                        model.Add(x[b, t1["id"]] + x[b, t2["id"]] <= 1)
-        
-        # CONSTRAINT 6: Route continuity (relaxed for feasibility)
-        # Similar to regular phase - only enforce for same-day consecutive trips
-        for b in range(B):
-            for day in range(4, 7):
-                day_trips = [t for t in viable_trips if t["day"] == day]
-                day_trips.sort(key=lambda t: t["start"])
-                
-                for i in range(len(day_trips) - 1):
-                    t1 = day_trips[i]
-                    t2 = day_trips[i + 1]
-                    
-                    # Check if these could be consecutive for same bus
-                    if (t2["start"] - t1["start"]) >= cycle_minutes // 60:  # Enough time gap
-                        t1_dest = t1["route"].split('-')[1]
-                        t2_origin = t2["origin"]
-                        if t1_dest != t2_origin:
-                            # These specific trips cannot be consecutive
-                            model.Add(x[b, t1["id"]] + x[b, t2["id"]] <= 1)
-        
-        # CONSTRAINT 7: NIGHT COVERAGE - ensure some night trips
-        for day in range(4, 7):
-            night_trips = [t["id"] for t in viable_trips 
-                          if t["day"] == day and (t["start"] >= 1320 or t["start"] <= 240)]
-            if night_trips:
-                # Ensure at least 2 night trips per day (relaxed)
-                model.Add(sum(x[b, tid] for b in range(B) for tid in night_trips) >= 2)
-        
-        # CONSTRAINT 8: UTILIZATION - encourage bus usage (relaxed)
-        for b in range(B):
-            # Each bus should do at least 2 trips total across all 3 days
-            all_trips = [t["id"] for t in viable_trips]
-            model.Add(sum(x[b, tid] for tid in all_trips) >= 2)
-        
-        # CONSTRAINT 9: TARGET TRIP COUNT - aim for good utilization  
-        for day in range(4, 7):
-            day_trips = [t["id"] for t in viable_trips if t["day"] == day]
-            # Try to achieve at least 6 trips per day (further relaxed)
-            model.Add(sum(x[b, tid] for b in range(B) for tid in day_trips) >= 6)
-        
-        # OBJECTIVE: Maximize EPK + premium bonuses + night coverage
-        total_epk = sum(t["epk"] * x[b, t["id"]] for b in range(B) for t in viable_trips)
-        
-        # Premium bonuses
-        premium_bonus = sum(
-            500 * x[b, t["id"]] for b in range(B) for t in viable_trips
-            if t["epk"] >= 95.0
-        )
-        
-        # Night premium bonus
-        night_premium_bonus = sum(
-            1000 * x[b, t["id"]] for b in range(B) for t in viable_trips
-            if (t["start"] >= 1320 or t["start"] <= 240) and t["epk"] >= 85.0
-        )
-        
-        # Night coverage bonus
-        night_coverage = sum(
-            200 * x[b, t["id"]] for b in range(B) for t in viable_trips
-            if t["start"] >= 1320 or t["start"] <= 240
-        )
-        
-        # Trip count bonus (secondary priority)
-        total_trips = sum(x[b, t["id"]] for b in range(B) for t in viable_trips)
-        
-        # Weighted objective (prioritize EPK quality + night coverage)
-        model.Maximize(
-            100 * total_epk +           # Base EPK value
-            premium_bonus +            # Premium trip bonus
-            night_premium_bonus +      # Night premium bonus
-            night_coverage +           # Night coverage bonus
-            50 * total_trips          # Trip count bonus (lower priority)
-        )
-        
-        # Solve
-        solver = cp_model.CpSolver()
-        solver.parameters.max_time_in_seconds = 60.0  # 1 minute timeout
-        
-        self.logger.info(f"Solving Peak CP-SAT model with {len(viable_trips)} trips, {B} buses")
-        status = solver.Solve(model)
-        
-        schedule = {d: [] for d in range(4, 7)}
-        
-        if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
-            self.logger.info(f"CP-SAT Peak solution: {solver.StatusName(status)}")
-            
-            assignments = []
-            for b in range(B):
-                for t in viable_trips:
-                    if solver.Value(x[b, t["id"]]) == 1:
-                        bus_id = b + 1  # Convert to 1-based
-                        day = t["day"]
-                        
-                        # Update bus manager
-                        trip_start = day * 1440 + t["start"]
-                        self.bus_manager.assign_trip(bus_id, trip_start, day, t["route"], t["epk"])
-                        
-                        # Add to schedule
-                        trip_data = {
-                            "bus": bus_id,
-                            "id": t["id"],
-                            "start": t["start"],
-                            "route": t["route"],
-                            "origin": t["origin"],
-                            "epk": t["epk"],
-                            "day": day,
-                            "cpsat_solution": True
-                        }
-                        schedule[day].append(trip_data)
-                        assignments.append(trip_data)
-            
-            # Print results
-            total_trips = len(assignments)
-            total_revenue = sum(a["epk"] for a in assignments)
-            night_trips = len([a for a in assignments 
-                             if a["start"] >= 1320 or a["start"] <= 240])
-            premium_trips = len([a for a in assignments if a["epk"] >= 95.0])
-            night_premium_trips = len([a for a in assignments 
-                                     if (a["start"] >= 1320 or a["start"] <= 240) and a["epk"] >= 85.0])
-            
-            print(f"\n📊 PEAK CP-SAT RESULTS:")
-            print(f"   Status: {solver.StatusName(status)}")
-            print(f"   Total trips: {total_trips}")
-            print(f"   Total revenue: ₹{total_revenue:.2f}")
-            print(f"   Average EPK: ₹{total_revenue/total_trips:.2f}" if total_trips > 0 else "   No trips")
-            print(f"   Premium trips (≥₹95): {premium_trips}")
-            print(f"   Night coverage: {night_trips} trips")
-            print(f"   Night premium: {night_premium_trips} trips")
-            print(f"   Utilization: {total_trips/60*100:.1f}% (target: 60 trips)")
-            
-            for day in range(4, 7):
-                day_name = ["Friday", "Saturday", "Sunday"][day - 4]
-                day_trips = len(schedule[day])
-                day_revenue = sum(t["epk"] for t in schedule[day])
-                day_night = len([t for t in schedule[day] if t["start"] >= 1320 or t["start"] <= 240])
-                day_premium = len([t for t in schedule[day] if t["epk"] >= 95.0])
-                print(f"   {day_name}: {day_trips} trips, ₹{day_revenue:.2f}, {day_night} night, {day_premium} premium")
-                
+# HTML stub (kept minimal)
+HTML = """<!doctype html><html><head><meta charset="utf-8">
+<style>body{font-family:Arial;margin:0;padding:1rem;font-size:14px}
+table{border-collapse:collapse;width:100%}
+th,td{border:1px solid #ccc;padding:4px;text-align:center}
+th{background:#333;color:#fff}tr:nth-child(odd){background:#f9f9f9}
+.bus{border-radius:6px;padding:4px;margin:2px;display:inline-block;width:90px;color:#fff}
+.ab{background:#e76f51}.ba{background:#2a9d8f}</style></head><body>
+<h2>Peak‑weekend schedule (Fri–Sun)</h2>
+<table><thead><tr><th>Day</th><th>{{ab}}</th><th>{{ba}}</th></tr></thead><tbody>
+{% for i,d in enumerate(days) %}<tr><td><b>{{d}}</b></td>
+<td>{% for bus,tr in ab[i] %}<div class="bus ab">{{bus}}<br>{{tr.start}}</div>{% endfor %}</td>
+<td>{% for bus,tr in ba[i] %}<div class="bus ba">{{bus}}<br>{{tr.start}}</div>{% endfor %}</td>
+</tr>{% endfor %}</tbody></table></body></html>"""
+
+# -----------------  HELPERS  -----------------
+def slot2str(s): return f"{s//2:02d}:{(s%2)*30:02d}:00"
+
+def load_epk(csv:Path):
+    df=pd.read_csv(csv)
+    day_cols=[c for c in df.columns if c.isdigit()]
+    day_cols.sort(key=int)
+    df["slot_idx"]=(pd.to_timedelta(df["slot"]).dt.components.hours*2 +
+                    pd.to_timedelta(df["slot"]).dt.components.minutes//30).astype(int)
+    routes=sorted(df["route"].unique())
+    if len(routes)!=2: raise ValueError("Need exactly two routes in CSV.")
+    rAB,rBA=routes
+    epk={}
+    for _,r in df.iterrows():
+        s=int(r["slot_idx"])
+        if s in FORBIDDEN: continue
+        for d,c in enumerate(day_cols):
+            epk[(r["route"],d,c,s)] = float(r[c])   # key by (route, d‑idx, label, slot)
+    return epk,day_cols,rAB,rBA
+
+def initial_and_target(json_path:Path, rAB, rBA):
+    data=json.load(open(json_path))
+    init=[]; target=[]
+    for b in range(len(data["schedule"])):
+        bus=f"Bus-{b+1:02d}"
+        # Thursday last trip
+        last_tr=data["schedule"][bus]["4"][-1]["route"]
+        init.append("A" if last_tr==rBA else "B")
+        # Monday first trip
+        first_tr=data["schedule"][bus]["1"][0]["route"]
+        target.append("A" if first_tr==rAB else "B")
+    return init,target
+
+# -----------------  SOLVER  -----------------
+def solve_peak(epk, epk_days, rAB, rBA,
+               travel_s, charge_s, idle_s,
+               init_st, target_st,
+               limit=300):
+    TOTAL=travel_s+charge_s
+    FIRST_ALLOWED=[s for s in ALLOWED if s+TOTAL+idle_s<=SLOTS_PER-1]
+
+    B=len(init_st); D=len(PEAK_DAYS)
+    m=cp_model.CpModel()
+    y,start={},{}                      # decision vars
+    trips_per_bus=[[] for _ in range(B)]
+    high_vars=[]; epk_terms=[]
+
+    for b in range(B):
+        for di,day in enumerate(PEAK_DAYS):
+            for t in range(2):         # at most 2 trips
+                rt0 = rAB if init_st[b]=="A" else rBA
+                rt  = (rt0 if t==0 else (rBA if rt0==rAB else rAB))
+                pool=FIRST_ALLOWED if t==0 else ALLOWED
+                for s in pool:
+                    if (rt, epk_days.index(day), day, s) in epk:
+                        y[(b,di,t,s)]=m.NewBoolVar(f"y_{b}_{di}_{t}_{s}")
+                # mandatory first trip, optional second
+                required=1 if t==0 else 0
+                m.Add(sum(y[(b,di,t,s)] for s in pool if (b,di,t,s) in y)>=required)
+                m.Add(sum(y[(b,di,t,s)] for s in pool if (b,di,t,s) in y)<=1)
+                # start time var
+                st=m.NewIntVar(0,SLOTS_PER-1,f"st_{b}_{di}_{t}")
+                m.Add(st==sum(s*y[(b,di,t,s)] for s in pool if (b,di,t,s) in y))
+                start[(b,di,t)]=st
+                if t==1:
+                    m.Add(st >= start[(b,di,0)] + TOTAL)
+                    # idle upper bound only for Saturday (di==1) – else soft
+                    if day not in ("5","7"):
+                        m.Add(st - start[(b,di,0)] <= TOTAL+idle_s)
+
+                # bookkeeping
+                trips_per_bus[b].append((rt,di,t,st))
+                epk_val = epk.get((rt, epk_days.index(day), day, 0),0)  # any slot key to fetch route existence
+            # end t loop
+        # end day loop
+    # ----- 50 % night‑high rule -----
+    for di,day in enumerate(PEAK_DAYS):
+        if day=="5":
+            demand=rAB
+        elif day=="7":
+            demand=rBA
         else:
-            self.logger.error(f"CP-SAT Peak failed: {solver.StatusName(status)}")
-        
-        return schedule 
+            continue
+        total=[]; high=[]
+        for (b,ddi,t,s),var in y.items():
+            if ddi!=di: continue
+            rt = rAB if (t==0) ^ (init_st[b]=="B") else rBA
+            total.append(var)
+            if rt==demand and s in NIGHT_SLOTS and \
+               epk.get((rt, epk_days.index(day), day, s),0) >= EPK_THRESH:
+                high.append(var)
+        if total:
+            m.Add( 2*sum(high) >= sum(total) )
+
+    # ----- utilisation floor (95 %) -----
+    max_trips = B * 2 * D
+    m.Add(sum(y.values()) >= int(UTIL_FLOOR * max_trips))
+
+    # ----- parity constraint to hit Monday start station -----
+    for b in range(B):
+        tot = m.NewIntVar(0, 2*D, f"tot_{b}")
+        m.Add(tot == sum(y[(b,di,t,s)] for (bb,di,t,s) in y if bb==b))
+        par = m.NewIntVar(0,1,f"par_{b}")
+        m.AddModuloEquality(par, tot, 2)
+        need = 0 if init_st[b]==target_st[b] else 1
+        m.Add(par == need)
+
+    # ----- objective: maximise #high slots first, then EPK -----
+    for (b,di,t,s),var in y.items():
+        rt = rAB if (t==0) ^ (init_st[b]=="B") else rBA
+        epk_val = epk.get((rt, epk_days.index(PEAK_DAYS[di]), PEAK_DAYS[di], s),0)
+        epk_terms.append(int(epk_val*100)*var)
+        if ((PEAK_DAYS[di]=="5" and rt==rAB) or (PEAK_DAYS[di]=="7" and rt==rBA)) and \
+            s in NIGHT_SLOTS and epk_val>=EPK_THRESH:
+            high_vars.append(var)
+
+    m.Maximize( 1_000_000*sum(high_vars) + sum(epk_terms) )
+
+    solver=cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds=limit
+    solver.parameters.num_search_workers=8
+    if solver.Solve(m) not in (cp_model.OPTIMAL,cp_model.FEASIBLE):
+        raise RuntimeError("No feasible peak schedule (relax thresholds or idle).")
+
+    # ----- build result -----
+    out={}
+    for b in range(B):
+        bus=f"Bus-{b+1:02d}"; out[bus]={}
+        for di,day in enumerate(PEAK_DAYS):
+            trips=[]
+            for t in range(2):
+                st=int(solver.Value(start[(b,di,t)]))
+                if st<0 or st>=SLOTS_PER: continue   # trip not selected
+                rt=rAB if (t==0) ^ (init_st[b]=="B") else rBA
+                trips.append({"route":rt,"start":slot2str(st)})
+            trips.sort(key=lambda x:x["start"])
+            out[bus][day]=trips
+    return out
+
+# -----------------  HTML writer -----------------
+def html_report(sched, html_path, days, rAB, rBA):
+    ab=[[] for _ in days]; ba=[[] for _ in days]
+    for bus,mp in sched.items():
+        for i,d in enumerate(days):
+            for tr in mp[d]:
+                (ab if tr["route"]==rAB else ba)[i].append((bus,tr))
+    for i in range(len(days)):
+        ab[i].sort(key=lambda bt:bt[1]["start"])
+        ba[i].sort(key=lambda bt:bt[1]["start"])
+    html_path.write_text(
+        Template(HTML).render(days=days,ab=ab,ba=ba,
+                              ab_label=rAB,ba_label=rBA), encoding="utf-8")
+
+# -----------------  CLI  -----------------
+def ask_path(msg,defv): v=input(f"{msg} [{defv}]: ").strip(); return Path(v) if v else Path(defv)
+def ask_int (msg,defv): v=input(f"{msg} [{defv}]: ").strip(); return int(v) if v else defv
+
+def main():
+    csv = ask_path("EPK CSV", "epk_data.csv")
+    j_prev = ask_path("Previous JSON schedule", "schedule.json")
+    out_json = ask_path("Peak JSON output", "peak_schedule.json")
+    out_html = ask_path("Peak HTML output", "peak_schedule.html")
+    travel_h = ask_int("Travel hours (one leg)", 9)
+    charge_h = ask_int("Depot charge hours", 2)
+    idle_h   = ask_int("Max *extra* idle hours", 6)
+
+    print("⏳ Loading data …")
+    epk, epk_days, rAB, rBA = load_epk(csv)
+    init,target = initial_and_target(j_prev, rAB, rBA)
+
+    print("⚙️  Solving peak‑weekend …")
+    sched = solve_peak(epk, epk_days, rAB, rBA,
+                       travel_h*2, charge_h*2, idle_h*2,
+                       init, target)
+
+    print("💾 Writing outputs …")
+    out_json.write_text(json.dumps({"schedule":sched},indent=2))
+    html_report(sched, out_html, PEAK_DAYS, rAB, rBA)
+    print(f"✅ Peak JSON → {out_json}\n✅ Peak HTML → {out_html}")
+
+if __name__=="__main__":
+    try: main()
+    except Exception as e:
+        print("❌",e); sys.exit(1)
