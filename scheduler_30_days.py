@@ -22,7 +22,7 @@ FORBIDDEN = {1,2,3,4,5,6}      # 00:30‑03:00 departure slots
 SLOTS_PER_DAY = 48             # 30‑min grid
 ALLOWED = [s for s in range(SLOTS_PER_DAY) if s not in FORBIDDEN]
 TRIPS_PER_DAY = 2              # per bus
-SPACING = 2                    # ≥ 1 h between same‑station departs
+SPACING = 1                    # ≥ 1 h between same‑station departs
 DEFAULT_JSON = Path("schedule.json")
 DEFAULT_HTML = Path("schedule.html")
 
