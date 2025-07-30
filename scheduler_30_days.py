@@ -37,7 +37,17 @@ th{background:#333;color:#fff}tr:nth-child(odd){background:#f9f9f9}
 .bus{border-radius:6px;padding:4px;margin:2px;display:inline-block;width:90px;color:#fff}
 .ab{background:#e76f51}.ba{background:#2a9d8f}
 </style></head><body>
-<h2>EV Schedule ({{days|length}} days, {{trips}} trips/bus/day)</h2>
+<div style="background:#00bcd4;color:#fff;padding:1rem;text-align:center;">
+  <h2>EV Bus Schedule</h2>
+  <div>
+    <strong>Route 1:</strong> {{ routeAB_name }} &nbsp; | &nbsp;
+    <strong>Route 2:</strong> {{ routeBA_name }}
+  </div>
+  <div>
+    <strong>No. of Buses:</strong> {{ total_buses }} &nbsp; | &nbsp;
+    <strong>Avg EPK:</strong> {{ avg_epk }}
+  </div>
+</div>
 <table><thead><tr><th>Day</th><th>{{ab}}</th><th>{{ba}}</th></tr></thead><tbody>
 {% for d in range(days|length) %}
 <tr><td><strong>{{days[d]}}</strong></td>
@@ -152,6 +162,18 @@ def solve(epk, days, routeAB, routeBA,
             sched[bus][dy]=trips
     return sched
 
+def compute_metrics(sched):
+    total_buses = len(sched)
+    total_epk = 0
+    total_trips = 0
+    for bus in sched.values():
+        for day in bus.values():
+            for trip in day:
+                total_epk += trip["epk"]
+                total_trips += 1
+    avg_epk = round(total_epk / total_trips, 2) if total_trips else 0
+    return total_buses, avg_epk
+
 # ─────────────────────────  HTML WRITER  ─────────────────────────
 def html_out(sched, html, days, routeAB, routeBA):
     ab=[[] for _ in days]; ba=[[] for _ in days]
@@ -162,15 +184,18 @@ def html_out(sched, html, days, routeAB, routeBA):
     for i in range(len(days)):
         ab[i].sort(key=lambda bt:bt[1]["startTime"])
         ba[i].sort(key=lambda bt:bt[1]["startTime"])
+    total_buses, avg_epk = compute_metrics(sched)
     html.write_text(
-    Template(HTML).render(
-        days=days,
-        ab=ab,            # list of trips A→B
-        ba=ba,            # list of trips B→A
-        routeAB_name=routeAB,
-        routeBA_name=routeBA,
-        trips=TRIPS_PER_DAY
-    ),
+        Template(HTML).render(
+            days=days,
+            ab=ab,
+            ba=ba,
+            routeAB_name=routeAB,
+            routeBA_name=routeBA,
+            trips=TRIPS_PER_DAY,
+            total_buses=total_buses,
+            avg_epk=avg_epk
+        ),
         encoding="utf-8"
     )
 
@@ -182,7 +207,7 @@ def ask_path(msg, default):
 
 def main():
     print("Electric‑Bus Month Scheduler")
-    csv = ask_path("Path to EPK CSV", "epk_data.csv")
+    csv = ask_path("Path to EPK CSV", "cache/epk_h_v_month.csv")
     busesA = ask_int("Buses at Station A",5)
     busesB = ask_int("Buses at Station B",5)
     travel_h = ask_int("Travel hours (one leg)",9)
