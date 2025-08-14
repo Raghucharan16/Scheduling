@@ -31,11 +31,47 @@ def s2t(s): return f"{s//2:02d}:{(s%2)*30:02d}:00"
 HTML = """<!doctype html><html><head>
 <meta charset="utf-8"><style>
 body{font-family:Arial,Helvetica,sans-serif;margin:0;padding:1rem;font-size:14px}
-table{border-collapse:collapse;width:100%}
-th,td{border:1px solid #ccc;padding:4px;text-align:center}
-th{background:#333;color:#fff}tr:nth-child(odd){background:#f9f9f9}
-.bus{border-radius:6px;padding:4px;margin:2px;display:inline-block;width:90px;color:#fff}
-.ab{background:#e76f51}.ba{background:#2a9d8f}
+table{border-collapse:collapse;width:100%;margin-top:20px}
+th,td{border:1px solid #ccc;padding:8px;text-align:center;vertical-align:top}
+th{background:#333;color:#fff;font-weight:bold}
+tr:nth-child(odd){background:#f9f9f9}
+.bus{background:#4CAF50;color:#fff;border-radius:4px;padding:6px;margin:2px;display:inline-block;width:80px;font-size:12px;font-weight:bold}
+.bus-time{font-size:11px;margin-top:2px}
+.bus-epk{font-size:10px;opacity:0.9;margin-top:2px}
+.route-header{background:#00bcd4;color:#fff;padding:8px;text-align:center;font-weight:bold}
+
+/* Route A (Hyderabad-Vijayawada) - Blue theme */
+.bus-route-a{background:#2196F3;color:#fff}
+.bus-route-a:hover{background:#1976D2}
+
+/* Route B (Vijayawada-Hyderabad) - Orange theme */
+.bus-route-b{background:#FF9800;color:#fff}
+.bus-route-b:hover{background:#F57C00}
+
+/* Individual bus colors for better identification */
+.bus-01{background:#E91E63}
+.bus-02{background:#9C27B0}
+.bus-03{background:#673AB7}
+.bus-04{background:#3F51B5}
+.bus-05{background:#2196F3}
+.bus-06{background:#00BCD4}
+.bus-07{background:#009688}
+.bus-08{background:#4CAF50}
+.bus-09{background:#8BC34A}
+.bus-10{background:#CDDC39}
+.bus-11{background:#FFEB3B}
+.bus-12{background:#FFC107}
+.bus-13{background:#FF9800}
+.bus-14{background:#FF5722}
+.bus-15{background:#795548}
+.bus-16{background:#607D8B}
+.bus-17{background:#9E9E9E}
+.bus-18{background:#F44336}
+.bus-19{background:#E91E63}
+.bus-20{background:#9C27B0}
+
+/* Hover effects */
+.bus:hover{opacity:0.8;transform:scale(1.05);transition:all 0.2s ease}
 </style></head><body>
 <div style="background:#00bcd4;color:#fff;padding:1rem;text-align:center;">
   <h2>EV Bus Schedule</h2>
@@ -48,13 +84,63 @@ th{background:#333;color:#fff}tr:nth-child(odd){background:#f9f9f9}
     <strong>Avg EPK:</strong> {{ avg_epk }}
   </div>
 </div>
-<table><thead><tr><th>Day</th><th>{{ab}}</th><th>{{ba}}</th></tr></thead><tbody>
+
+<table>
+<thead>
+<tr>
+<th style="width:80px">Day</th>
+<th style="width:45%">
+  <div class="route-header" style="background:#2196F3">{{ routeAB_name }}</div>
+</th>
+<th style="width:45%">
+  <div class="route-header" style="background:#FF9800">{{ routeBA_name }}</div>
+</th>
+</tr>
+</thead>
+<tbody>
 {% for d in range(days|length) %}
-<tr><td><strong>{{days[d]}}</strong></td>
-<td>{% for bus,tr in ab[d] %}<div class="bus ab">{{bus}}<br>{{tr.startTime}}<br>{{tr.epk}}</div>{% endfor %}</td>
-<td>{% for bus,tr in ba[d] %}<div class="bus ba">{{bus}}<br>{{tr.startTime}}<br>{{tr.epk}}</div>{% endfor %}</td>
-</tr>{% endfor %}
-</tbody></table></body></html>"""
+<tr>
+<td style="background:#f0f0f0;font-weight:bold">{{days[d]}}</td>
+<td>
+  {% for bus,tr in ab[d] %}
+  {% set bus_num = bus.split('-')[1] %}
+  <div class="bus bus-{{bus_num}} bus-route-a" title="{{bus}} - {{tr.startTime}} - EPK: {{tr.epk}}">
+    {{bus}}
+    <div class="bus-time">{{tr.startTime}}</div>
+    <div class="bus-epk">EPK: {{tr.epk}}</div>
+  </div>
+  {% endfor %}
+</td>
+<td>
+  {% for bus,tr in ba[d] %}
+  {% set bus_num = bus.split('-')[1] %}
+  <div class="bus bus-{{bus_num}} bus-route-b" title="{{bus}} - {{tr.startTime}} - EPK: {{tr.epk}}">
+    {{bus}}
+    <div class="bus-time">{{tr.startTime}}</div>
+    <div class="bus-epk">EPK: {{tr.epk}}</div>
+  </div>
+  {% endfor %}
+</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+
+<div style="margin-top:20px;padding:15px;background:#f5f5f5;border-radius:5px;">
+  <h4>Color Legend:</h4>
+  <div style="display:flex;justify-content:space-around;flex-wrap:wrap;">
+    <div style="margin:5px;">
+      <span style="background:#2196F3;color:#fff;padding:5px;border-radius:3px;">{{ routeAB_name }}</span>
+    </div>
+    <div style="margin:5px;">
+      <span style="background:#FF9800;color:#fff;padding:5px;border-radius:3px;">{{ routeBA_name }}</span>
+    </div>
+  </div>
+  <p style="font-size:12px;color:#666;margin-top:10px;">
+    <strong>Note:</strong> Each bus maintains the same color across all days for easy identification.
+  </p>
+</div>
+</body></html>"""
 
 # ─────────────────────────  LOAD CSV  ─────────────────────────
 def load_epk(csv_path: Path):
