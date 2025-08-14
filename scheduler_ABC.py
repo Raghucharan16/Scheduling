@@ -12,8 +12,8 @@ from ortools.sat.python import cp_model
 # Parameters
 # ─────────────────────────────────────────────────────────────
 FORBIDDEN_SLOTS = {1, 2, 3, 4, 5, 6}  # 00:30–03:00 blocked for departures
-SLOTS_PER_DAY   = 48                  # 30-min grid
-MIN_GAP_SLOTS   = 1                   # ≥1h spacing at a station
+SLOTS_PER_DAY   = 48                  # 30‑min grid
+MIN_GAP_SLOTS   = 1                   # spacing in slots (default 1 slot = 30min)
 TIME_LIMIT_SEC  = 300
 
 ROUTES   = ["A-B", "B-A", "B-C", "C-B"]
@@ -68,7 +68,7 @@ def load_and_impute(csv_path: Path,
     imputed_keys: Set[Tuple[str,str,int]] = set()
     allowed_slots = [s for s in range(SLOTS_PER_DAY) if s not in FORBIDDEN_SLOTS]
 
-    # Month medians per route (observed > 0 unless treat_zero_as_missing=False)
+    # Month medians per route
     med_route = {}
     for r in ROUTES:
         sub = df[df["route"]==r]
@@ -107,7 +107,7 @@ def load_and_impute(csv_path: Path,
                     imputed_keys.add((r, d, s))
                 continue
 
-            # Interpolate + short extrapolate (new API to avoid warnings)
+            # Interpolate + short extrapolate
             s_work = series.copy()
             s_work = s_work.interpolate(method="linear", limit_direction="both")
             s_work = s_work.ffill().bfill()
@@ -156,13 +156,6 @@ def has_compatible_second_abs(route: str,
                               epk_map: Dict[Tuple[str,str,int], float],
                               travel_slots: Dict[str,int],
                               total_slots: Dict[str,int]) -> bool:
-    """
-    True iff there exists a second leg (r2, t2_abs) with:
-        t2_abs >= t_abs + total_slots[route]            (ready after first incl. charge)
-        t2_abs <= t_abs + 48 - travel_slots[r2]         (second TRAVEL finishes within 24h)
-        EPK exists at (r2, day_of(t2_abs), slot_of(t2_abs))
-    Checks same day and next day if needed.
-    """
     if route == "A-B":
         second_routes = ("B-A", "B-C")
     elif route == "C-B":
@@ -197,11 +190,12 @@ def has_compatible_second_abs(route: str,
     return False
 
 # ─────────────────────────────────────────────────────────────
-# Stage 1: CP-SAT flow (aggregate), with absolute-time prefilter
+# Stage 1: CP-SAT flow (aggregate)
 # ─────────────────────────────────────────────────────────────
 def solve_flow(epk_map, weight_map, day_labels, nA, nB, nC,
                travel_slots, total_slots,
-               min_gap=MIN_GAP_SLOTS, timelimit=TIME_LIMIT_SEC):
+               min_gap=MIN_GAP_SLOTS, timelimit=TIME_LIMIT_SEC,
+               require_pair_for_first: bool = False):
     D = len(day_labels)
     T = D * SLOTS_PER_DAY
     def day_of(t): return day_labels[t // SLOTS_PER_DAY]
@@ -210,31 +204,29 @@ def solve_flow(epk_map, weight_map, day_labels, nA, nB, nC,
     m = cp_model.CpModel()
     Y = {}
 
-    # departure var only where EPK exists AND has a compatible second across 24h
+    # Only forbid forbidden slots; prefilter by second‑leg only if required
     for t in range(T):
         s = slot_of(t)
-        if s in FORBIDDEN_SLOTS: 
+        if s in FORBIDDEN_SLOTS:
             continue
         dlab = day_of(t)
         for r in ROUTES:
             if (r, dlab, s) not in epk_map:
                 continue
-            if not has_compatible_second_abs(
-                    route=r, t_abs=t, day_labels=day_labels,
-                    epk_map=epk_map, travel_slots=travel_slots, total_slots=total_slots):
-                continue
+            if require_pair_for_first:
+                if not has_compatible_second_abs(
+                        route=r, t_abs=t, day_labels=day_labels,
+                        epk_map=epk_map, travel_slots=travel_slots, total_slots=total_slots):
+                    continue
             Y[(r,t)] = m.NewBoolVar(f"D_{r.replace('-','')}_{t}")
 
-    # inventories — PRE-ALLOCATE ALL keys to avoid KeyError
+    # inventories — PRE‑ALLOCATE all keys
     fleet = nA+nB+nC
     I = {}
     for st in ("A","B","C"):
         for tt in range(0, T+1):  # 0..T inclusive
             I[(st,tt)] = m.NewIntVar(0, fleet, f"I_{st}_{tt}")
-    # initial inventories
-    m.Add(I[("A",0)]==nA)
-    m.Add(I[("B",0)]==nB)
-    m.Add(I[("C",0)]==nC)
+    m.Add(I[("A",0)]==nA); m.Add(I[("B",0)]==nB); m.Add(I[("C",0)]==nC)
 
     routes_out = {"A":["A-B"], "B":["B-A","B-C"], "C":["C-B"]}
     routes_in  = {"A":["B-A"], "B":["A-B","C-B"], "C":["B-C"]}
@@ -265,7 +257,7 @@ def solve_flow(epk_map, weight_map, day_labels, nA, nB, nC,
                 if both:
                     m.Add(sum(both) <= 1)
 
-    # objective: epk * weight (slight penalty for imputed)
+    # objective: epk * weight
     obj=[]
     for (r,t),var in Y.items():
         dlab = day_of(t); s = slot_of(t)
@@ -285,7 +277,7 @@ def solve_flow(epk_map, weight_map, day_labels, nA, nB, nC,
     return deps, T
 
 # ─────────────────────────────────────────────────────────────
-# Stage 2: per-bus assignment (immediate second reservation; 2-in-24)
+# Stage 2: per‑bus assignment (2‑in‑24 when possible; ≥1/day if desired)
 # ─────────────────────────────────────────────────────────────
 class Bus:
     __slots__=("name","station","ready","anchor","count","first_route")
@@ -310,8 +302,9 @@ def assign_buses_with_pairing(departures: List[Tuple[int,str]],
                               travel_slots: Dict[str,int],
                               total_slots: Dict[str,int],
                               day_labels: List[str],
-                              nA:int, nB:int, nC:int) -> Dict[str, List[dict]]:
-    unassigned = departures[:]  # sorted
+                              nA:int, nB:int, nC:int,
+                              require_pair_for_first: bool=False) -> Dict[str, List[dict]]:
+    unassigned = departures[:]  # sorted by absolute time
     from collections import defaultdict, deque
     route_idx = defaultdict(deque)
     for i,(t,r) in enumerate(unassigned):
@@ -343,61 +336,80 @@ def assign_buses_with_pairing(departures: List[Tuple[int,str]],
         if taken[i]: continue
         o,d = ORIG[r], DEST[r]
         ready_ids = [idx for idx in pools[o] if buses[idx].ready <= t]
+        # prefer buses that are waiting for their second leg
         ready_ids.sort(key=lambda idx:(buses[idx].count!=1, buses[idx].ready))
 
         chosen=None; as_second=False
-        # (A) Try to satisfy as SECOND if some bus is waiting
+        # (A) If a bus is waiting (count==1) and station matches, try to schedule its SECOND
         for idx in ready_ids:
             b=buses[idx]
             if b.count==1 and ORIG[r]==b.station:
-                latest = b.anchor + SLOTS_PER_DAY - travel_slots[r]  # travel must finish within 24h
+                latest = b.anchor + SLOTS_PER_DAY - travel_slots[r]  # second TRAVEL must finish within 24h
                 if t <= latest:
                     chosen=idx; as_second=True; break
 
-        # (B) Otherwise as FIRST, but only if we can reserve SECOND immediately
+        # (B) Otherwise, try as FIRST.
         if chosen is None:
             for idx in ready_ids:
                 b=buses[idx]
                 if b.count!=0 or r not in allowed_first(b.station): continue
                 anchor = t
                 first_ready = t + total_slots[r]
-                pick_j=None; pick_r2=None
-                for r2 in allowed_second(r):
-                    if ORIG[r2] != d:  continue
-                    latest2 = anchor + SLOTS_PER_DAY - travel_slots[r2]
-                    j = next_cand(r2, earliest=first_ready, latest=latest2)
-                    if j is not None: pick_j=j; pick_r2=r2; break
-                if pick_j is None:
-                    continue  # cannot pair → skip this first
-                # Commit FIRST + SECOND
-                chosen=idx
-                # FIRST
-                start=t; end_rdy=t+total_slots[r]; end_trv=t+travel_slots[r]
-                day1 = day_labels[start // SLOTS_PER_DAY]
-                out[day1].append({
-                    "busNumber": buses[chosen].name,
-                    "trip": {"route": r, "startStation": o, "endStation": d,
-                             "startTime": index_to_time(start % SLOTS_PER_DAY),
-                             "endTime":   index_to_time(end_trv % SLOTS_PER_DAY)}
-                })
-                take(i)
-                pools[o].remove(chosen)
-                b.station=d; b.ready=end_rdy; b.anchor=anchor; b.count=1; b.first_route=r
-                # SECOND
-                t2,_=unassigned[pick_j]
-                o2,d2=ORIG[pick_r2], DEST[pick_r2]
-                day2 = day_labels[t2 // SLOTS_PER_DAY]
-                out[day2].append({
-                    "busNumber": b.name,
-                    "trip": {"route": pick_r2, "startStation": o2, "endStation": d2,
-                             "startTime": index_to_time(t2 % SLOTS_PER_DAY),
-                             "endTime":   index_to_time((t2+travel_slots[pick_r2]) % SLOTS_PER_DAY)}
-                })
-                take(pick_j)
-                b.station=d2; b.ready=t2+total_slots[pick_r2]; b.count=2; b.first_route=None
-                pools[d2].append(chosen)
-                break
+                if require_pair_for_first:
+                    # old behavior: only take FIRST if we can reserve SECOND now
+                    pick_j=None; pick_r2=None
+                    for r2 in allowed_second(r):
+                        if ORIG[r2] != d:  continue
+                        latest2 = anchor + SLOTS_PER_DAY - travel_slots[r2]
+                        j = next_cand(r2, earliest=first_ready, latest=latest2)
+                        if j is not None: pick_j=j; pick_r2=r2; break
+                    if pick_j is None:
+                        continue  # cannot pair → skip this first
+                    # Commit FIRST + SECOND immediately
+                    chosen=idx
+                    start=t; end_rdy=t+total_slots[r]; end_trv=t+travel_slots[r]
+                    day1 = day_labels[start // SLOTS_PER_DAY]
+                    out[day1].append({
+                        "busNumber": buses[chosen].name,
+                        "trip": {"route": r, "startStation": o, "endStation": d,
+                                 "startTime": index_to_time(start % SLOTS_PER_DAY),
+                                 "endTime":   index_to_time(end_trv % SLOTS_PER_DAY)}
+                    })
+                    take(i)
+                    pools[o].remove(chosen)
+                    b.station=d; b.ready=end_rdy; b.anchor=anchor; b.count=1; b.first_route=r
+                    # SECOND
+                    t2,_=unassigned[pick_j]
+                    o2,d2=ORIG[pick_r2], DEST[pick_r2]
+                    day2 = day_labels[t2 // SLOTS_PER_DAY]
+                    out[day2].append({
+                        "busNumber": b.name,
+                        "trip": {"route": pick_r2, "startStation": o2, "endStation": d2,
+                                 "startTime": index_to_time(t2 % SLOTS_PER_DAY),
+                                 "endTime":   index_to_time((t2+travel_slots[pick_r2]) % SLOTS_PER_DAY)}
+                    })
+                    take(pick_j)
+                    b.station=d2; b.ready=t2+total_slots[pick_r2]; b.count=2; b.first_route=None
+                    pools[d2].append(chosen)
+                    break
+                else:
+                    # NEW: relaxed behavior — allow FIRST without reserving SECOND
+                    chosen=idx
+                    start=t; end_rdy=t+total_slots[r]; end_trv=t+travel_slots[r]
+                    day1 = day_labels[start // SLOTS_PER_DAY]
+                    out[day1].append({
+                        "busNumber": buses[chosen].name,
+                        "trip": {"route": r, "startStation": o, "endStation": d,
+                                 "startTime": index_to_time(start % SLOTS_PER_DAY),
+                                 "endTime":   index_to_time(end_trv % SLOTS_PER_DAY)}
+                    })
+                    take(i)
+                    pools[o].remove(chosen)
+                    b.station=d; b.ready=end_rdy; b.anchor=anchor; b.count=1; b.first_route=r
+                    pools[d].append(chosen)  # return to destination pool; may catch a second later
+                    break
 
+        # If we scheduled a SECOND now
         if chosen is not None and as_second:
             b=buses[chosen]
             pools[o].remove(chosen)
@@ -500,6 +512,7 @@ def main():
     min_gap = ask_int("Min spacing at a station (slots)", MIN_GAP_SLOTS)
     treat_zero_as_missing = ask_bool("Treat 0 EPK as missing (interpolate)?", True)
     imputed_weight = ask_float("Weight for imputed EPK (<=1 for slight penalty)", 0.95)
+    require_pair_for_first = ask_bool("Require reserving SECOND leg immediately? (two trips mandatory) [y/N]", False)
 
     json_out = ask_path("JSON output", "schedule_hub.json")
     html_out = ask_path("HTML output", "schedule_hub.html")
@@ -518,21 +531,23 @@ def main():
         ch_h
     )
 
-    # Stage 1: flow with absolute-time prefilter for 2nd legs
+    # Stage 1: flow (prefilter by second only if mandatory pairing)
     departures, _ = solve_flow(
         epk_map=epk_map, weight_map=weight_map,
         day_labels=day_labels, nA=nA, nB=nB, nC=nC,
         travel_slots=travel_slots, total_slots=total_slots,
-        min_gap=min_gap, timelimit=TIME_LIMIT_SEC
+        min_gap=min_gap, timelimit=TIME_LIMIT_SEC,
+        require_pair_for_first=require_pair_for_first
     )
 
-    # Stage 2: per-bus assignment with immediate second reservation
+    # Stage 2: per-bus assignment
     schedule_by_day = assign_buses_with_pairing(
         departures=departures,
         travel_slots=travel_slots,
         total_slots=total_slots,
         day_labels=day_labels,
-        nA=nA, nB=nB, nC=nC
+        nA=nA, nB=nB, nC=nC,
+        require_pair_for_first=require_pair_for_first
     )
 
     # Write outputs
