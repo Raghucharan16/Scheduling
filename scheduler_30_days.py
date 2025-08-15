@@ -175,77 +175,118 @@ def solve(epk, days, routeAB, routeBA,
           travel_s, charge_s, idle_s, limit=300):
 
     TOTAL = travel_s + charge_s
-    FIRST_OK = [s for s in ALLOWED if s+TOTAL+idle_s <= SLOTS_PER_DAY-1]
+    FIRST_OK = [s for s in ALLOWED if s + TOTAL + idle_s <= SLOTS_PER_DAY - 1]
 
     B = busesA + busesB
     D = len(days)
-    home = ["A"]*busesA + ["B"]*busesB
-    seqA = [routeAB, routeBA]; seqB=[routeBA, routeAB]
+    H = D * SLOTS_PER_DAY  # horizon in 30-min slots
+
+    home = ["A"] * busesA + ["B"] * busesB
+    seqA = [routeAB, routeBA]  # for A-home buses: A→B then B→A
+    seqB = [routeBA, routeAB]  # for B-home buses: B→A then A→B
 
     m = cp_model.CpModel()
-    y,start={},{}
+
+    y, start, abs_start = {}, {}, {}
+
+    # Decision vars: choose a start slot for each (bus, day, trip index)
     for b in range(B):
         for d in range(D):
             for t in range(TRIPS_PER_DAY):
-                rt = seqA[t] if home[b]=="A" else seqB[t]
-                pool = FIRST_OK if t==0 else ALLOWED
+                rt = seqA[t] if home[b] == "A" else seqB[t]
+                pool = FIRST_OK if t == 0 else ALLOWED
+
+                # create y[b,d,t,s] only for feasible (route,day,slot) that have EPK
                 for s in pool:
-                    if (rt,d,s) in epk:
-                        y[(b,d,t,s)] = m.NewBoolVar(f"y_{b}_{d}_{t}_{s}")
-                m.Add(sum(y[(b,d,t,s)] for s in pool if (b,d,t,s) in y)==1)
-                start[(b,d,t)] = m.NewIntVar(0,SLOTS_PER_DAY-1,f"st_{b}_{d}_{t}")
-                m.Add(start[(b,d,t)] ==
-                      sum(s*y[(b,d,t,s)] for s in pool if (b,d,t,s) in y))
+                    if (rt, d, s) in epk:
+                        y[(b, d, t, s)] = m.NewBoolVar(f"y_{b}_{d}_{t}_{s}")
 
-            # precedence + idle
-            m.Add(start[(b,d,1)] >= start[(b,d,0)] + TOTAL)
-            m.Add(start[(b,d,1)] - start[(b,d,0)] <= TOTAL + idle_s)
+                # exactly one start slot must be chosen
+                chosen = [y[(b, d, t, s)] for s in pool if (b, d, t, s) in y]
+                if not chosen:
+                    # If no slot has EPK for this (b,d,t), the instance is infeasible.
+                    # Create a dummy constraint to fail fast and explain.
+                    m.AddBoolOr([])  # always false -> infeasible if hit
+                else:
+                    m.Add(sum(chosen) == 1)
 
-    # spacing
+                # start time in local day
+                start[(b, d, t)] = m.NewIntVar(0, SLOTS_PER_DAY - 1, f"st_{b}_{d}_{t}")
+                m.Add(start[(b, d, t)] ==
+                      sum(s * y[(b, d, t, s)] for s in pool if (b, d, t, s) in y))
+
+                # absolute start time across the whole month
+                abs_start[(b, d, t)] = m.NewIntVar(0, H - 1, f"abs_st_{b}_{d}_{t}")
+                m.Add(abs_start[(b, d, t)] == start[(b, d, t)] + d * SLOTS_PER_DAY)
+
+            # Same-day precedence + (bounded) extra idle between the 2 daily trips
+            m.Add(start[(b, d, 1)] >= start[(b, d, 0)] + TOTAL)
+            m.Add(start[(b, d, 1)] - start[(b, d, 0)] <= TOTAL + idle_s)
+
+    # === NEW: Cross-day chaining (hard) ===
+    # Next day’s first trip cannot depart before previous day’s second trip
+    # completes travel + charge.
+    for b in range(B):
+        for d in range(D - 1):
+            m.Add(abs_start[(b, d + 1, 0)] >= abs_start[(b, d, 1)] + TOTAL)
+
+    # Spacing at each station (within day)
+    def safe(model, vars_, sense, rhs):
+        if vars_:
+            model.Add((sum(vars_)).__getattribute__(sense)(rhs))
+
     for d in range(D):
-        for station,rt in (("A",routeAB),("B",routeBA)):
-            group=[b for b in range(B) if home[b]==station]
-            idxA,idxB=(0,1) if station=="A" else (1,0)
+        for station, rt in (("A", routeAB), ("B", routeBA)):
+            group = [b for b in range(B) if home[b] == station]
+            idxA, idxB = (0, 1) if station == "A" else (1, 0)
             for s in ALLOWED:
-                now=[y[(b,d,idxA,s)] for b in group if (b,d,idxA,s) in y]+\
-                    [y[(b,d,idxB,s)] for b in group if (b,d,idxB,s) in y]
-                safe(m,now,"__le__",1)
-                for δ in range(1,SPACING):
-                    s2=s+δ
-                    if s2 not in ALLOWED:continue
-                    gap=now+[y[(b,d,idxA,s2)] for b in group if (b,d,idxA,s2) in y]+\
-                              [y[(b,d,idxB,s2)] for b in group if (b,d,idxB,s2) in y]
-                    safe(m,gap,"__le__",1)
+                now = [y[(b, d, idxA, s)] for b in group if (b, d, idxA, s) in y] + \
+                      [y[(b, d, idxB, s)] for b in group if (b, d, idxB, s) in y]
+                safe(m, now, "__le__", 1)
+                for δ in range(1, SPACING):
+                    s2 = s + δ
+                    if s2 not in ALLOWED:
+                        continue
+                    gap = now + \
+                          [y[(b, d, idxA, s2)] for b in group if (b, d, idxA, s2) in y] + \
+                          [y[(b, d, idxB, s2)] for b in group if (b, d, idxB, s2) in y]
+                    safe(m, gap, "__le__", 1)
 
-    # objective: sum(epk * y)
-    obj=[]
-    for (b,d,t,s),var in y.items():
-        rt = seqA[t] if home[b]=="A" else seqB[t]
-        obj.append(int(epk.get((rt,d,s),0)*100)*var)
+    # Objective: maximize total EPK
+    obj = []
+    for (b, d, t, s), var in y.items():
+        rt = seqA[t] if home[b] == "A" else seqB[t]
+        obj.append(int(epk.get((rt, d, s), 0) * 100) * var)
     m.Maximize(sum(obj))
 
-    solver=cp_model.CpSolver()
-    solver.parameters.max_time_in_seconds=limit
-    solver.parameters.num_search_workers=8
-    if solver.Solve(m) not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        raise RuntimeError("No feasible schedule – try larger max idle.")
+    solver = cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds = limit
+    solver.parameters.num_search_workers = 8
 
-    # build schedule
-    sched={}
+    status = solver.Solve(m)
+    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        raise RuntimeError("No feasible schedule – try larger max idle or check EPK coverage.")
+
+    # Build schedule (unchanged)
+    sched = {}
     for b in range(B):
-        bus=f"Bus-{b+1:02d}"; sched[bus]={}
-        for d,dy in enumerate(days):
-            trips=[]
+        bus = f"Bus-{b + 1:02d}"
+        sched[bus] = {}
+        for d, dy in enumerate(days):
+            trips = []
             for t in range(TRIPS_PER_DAY):
-                rt=seqA[t] if home[b]=="A" else seqB[t]
-                s=int(solver.Value(start[(b,d,t)]))
-                trips.append({"route":rt,
-                              "startTime":s2t(s),
-                              "midPointTime":s2t((s+travel_s//2)%SLOTS_PER_DAY),
-                              "endTime":s2t((s+travel_s)%SLOTS_PER_DAY),
-                              "epk":round(epk.get((rt,d,s),0),2)})
-            trips.sort(key=lambda x:x["startTime"])
-            sched[bus][dy]=trips
+                rt = seqA[t] if home[b] == "A" else seqB[t]
+                s = int(solver.Value(start[(b, d, t)]))
+                trips.append({
+                    "route": rt,
+                    "startTime": s2t(s),
+                    "midPointTime": s2t((s + travel_s // 2) % SLOTS_PER_DAY),
+                    "endTime": s2t((s + travel_s) % SLOTS_PER_DAY),
+                    "epk": round(epk.get((rt, d, s), 0), 2)
+                })
+            trips.sort(key=lambda x: x["startTime"])
+            sched[bus][dy] = trips
+
     return sched
 
 def compute_metrics(sched):
