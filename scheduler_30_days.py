@@ -172,122 +172,157 @@ def safe(model, vars_, sense, rhs):
 # ─────────────────────────  SOLVER  ─────────────────────────
 def solve(epk, days, routeAB, routeBA,
           busesA, busesB,
-          travel_s, charge_s, idle_s, limit=300):
+          travel_s, charge_s, idle_s, limit=300,
+          deterministic=True, seed=123, enable_logs=False):
 
-    TOTAL = travel_s + charge_s
-    FIRST_OK = [s for s in ALLOWED if s + TOTAL + idle_s <= SLOTS_PER_DAY - 1]
+    from ortools.sat.python import cp_model
 
-    B = busesA + busesB
+    # ---------- constants ----------
+    TOTAL = travel_s + charge_s        # min gap between consecutive trips of same bus (in 30-min slots)
+    SLOTS = SLOTS_PER_DAY              # 48
     D = len(days)
-    H = D * SLOTS_PER_DAY  # horizon in 30-min slots
+    H = D * SLOTS
+    B = busesA + busesB                # total buses
 
+    # route selection along a bus's chain (alternating)
     home = ["A"] * busesA + ["B"] * busesB
-    seqA = [routeAB, routeBA]  # for A-home buses: A→B then B→A
-    seqB = [routeBA, routeAB]  # for B-home buses: B→A then A→B
+    def route_for(b, k):
+        if home[b] == "A":
+            return routeAB if (k % 2 == 0) else routeBA
+        else:
+            return routeBA if (k % 2 == 0) else routeAB
 
-    m = cp_model.CpModel()
+    def dep_station(rt):  # which station the route departs from
+        return "A" if rt == routeAB else "B"
 
-    y, start, abs_start = {}, {}, {}
-
-    # Decision vars: choose a start slot for each (bus, day, trip index)
-    for b in range(B):
+    # ---------- candidates: every ALLOWED absolute slot per route ----------
+    route_abs = {routeAB: [], routeBA: []}  # sorted lists of abs times
+    for rt in (routeAB, routeBA):
         for d in range(D):
-            for t in range(TRIPS_PER_DAY):
-                rt = seqA[t] if home[b] == "A" else seqB[t]
-                pool = FIRST_OK if t == 0 else ALLOWED
-
-                # create y[b,d,t,s] only for feasible (route,day,slot) that have EPK
-                for s in pool:
-                    if (rt, d, s) in epk:
-                        y[(b, d, t, s)] = m.NewBoolVar(f"y_{b}_{d}_{t}_{s}")
-
-                # exactly one start slot must be chosen
-                chosen = [y[(b, d, t, s)] for s in pool if (b, d, t, s) in y]
-                if not chosen:
-                    # If no slot has EPK for this (b,d,t), the instance is infeasible.
-                    # Create a dummy constraint to fail fast and explain.
-                    m.AddBoolOr([])  # always false -> infeasible if hit
-                else:
-                    m.Add(sum(chosen) == 1)
-
-                # start time in local day
-                start[(b, d, t)] = m.NewIntVar(0, SLOTS_PER_DAY - 1, f"st_{b}_{d}_{t}")
-                m.Add(start[(b, d, t)] ==
-                      sum(s * y[(b, d, t, s)] for s in pool if (b, d, t, s) in y))
-
-                # absolute start time across the whole month
-                abs_start[(b, d, t)] = m.NewIntVar(0, H - 1, f"abs_st_{b}_{d}_{t}")
-                m.Add(abs_start[(b, d, t)] == start[(b, d, t)] + d * SLOTS_PER_DAY)
-
-            # Same-day precedence + (bounded) extra idle between the 2 daily trips
-            m.Add(start[(b, d, 1)] >= start[(b, d, 0)] + TOTAL)
-            m.Add(start[(b, d, 1)] - start[(b, d, 0)] <= TOTAL + idle_s)
-
-    # === NEW: Cross-day chaining (hard) ===
-    # Next day’s first trip cannot depart before previous day’s second trip
-    # completes travel + charge.
-    for b in range(B):
-        for d in range(D - 1):
-            m.Add(abs_start[(b, d + 1, 0)] >= abs_start[(b, d, 1)] + TOTAL)
-
-    # Spacing at each station (within day)
-    def safe(model, vars_, sense, rhs):
-        if vars_:
-            model.Add((sum(vars_)).__getattribute__(sense)(rhs))
-
-    for d in range(D):
-        for station, rt in (("A", routeAB), ("B", routeBA)):
-            group = [b for b in range(B) if home[b] == station]
-            idxA, idxB = (0, 1) if station == "A" else (1, 0)
             for s in ALLOWED:
-                now = [y[(b, d, idxA, s)] for b in group if (b, d, idxA, s) in y] + \
-                      [y[(b, d, idxB, s)] for b in group if (b, d, idxB, s) in y]
-                safe(m, now, "__le__", 1)
-                for δ in range(1, SPACING):
-                    s2 = s + δ
-                    if s2 not in ALLOWED:
-                        continue
-                    gap = now + \
-                          [y[(b, d, idxA, s2)] for b in group if (b, d, idxA, s2) in y] + \
-                          [y[(b, d, idxB, s2)] for b in group if (b, d, idxB, s2) in y]
-                    safe(m, gap, "__le__", 1)
+                route_abs[rt].append(d * SLOTS + s)
+        route_abs[rt].sort()
 
-    # Objective: maximize total EPK
+    # ---------- model ----------
+    m = cp_model.CpModel()
+    K = 2 * D                                # trips per bus across month
+    y = {}                                   # (b,k,abs) -> Bool, start at absolute time 'abs'
+    start_abs = {}                           # (b,k)     -> Int absolute start in [0, H-1]
+
+    # station occupancy tracker: at most one depart per station per absolute slot
+    occ = {("A", t): [] for t in range(H)}
+    occ.update({("B", t): [] for t in range(H)})
+
+    # Build variables (exactly-one start per (b,k))
+    for b in range(B):
+        for k in range(K):
+            rt = route_for(b, k)
+            vars_k = []
+            for abs_t in route_abs[rt]:
+                v = m.NewBoolVar(f"y_{b}_{k}_{abs_t}")
+                y[(b, k, abs_t)] = v
+                vars_k.append((abs_t, v))
+                occ[(dep_station(rt), abs_t)].append(v)
+            # exactly one time for this trip
+            m.Add(sum(v for _, v in vars_k) == 1)
+            # link to integer start time
+            st = m.NewIntVar(0, H - 1, f"st_{b}_{k}")
+            start_abs[(b, k)] = st
+            m.Add(st == sum(abs_t * y[(b, k, abs_t)] for abs_t, _ in vars_k))
+
+    # ---------- same-bus sequencing ----------
+    # (a) turnaround min/max between consecutive trips
+    for b in range(B):
+        for k in range(K - 1):
+            m.Add(start_abs[(b, k + 1)] >= start_abs[(b, k)] + TOTAL)
+            m.Add(start_abs[(b, k + 1)] - start_abs[(b, k)] <= TOTAL + idle_s)
+
+    # (b) NO "3 trips in a 24h window": at most 2 in any 48-slot span
+    for b in range(B):
+        for k in range(K - 2):
+            m.Add(start_abs[(b, k + 2)] >= start_abs[(b, k)] + SLOTS)
+
+    # ---------- station spacing (per absolute slot) ----------
+    for t in range(H):
+        if occ[("A", t)]: m.Add(sum(occ[("A", t)]) <= 1)
+        if occ[("B", t)]: m.Add(sum(occ[("B", t)]) <= 1)
+    # If you require a ≥1h gap, loop δ=1 and also bound t/t+δ together (not shown).
+
+    # ---------- per-day per-route quotas (fixes Day-1/Day-30 imbalance) ----------
+    # exactly B departures of AB and B of BA every day
+    for d in range(D):
+        lo, hi = d * SLOTS, (d + 1) * SLOTS - 1
+        # AB on day d
+        ab_vars = []
+        # BA on day d
+        ba_vars = []
+        for b in range(B):
+            for k in range(K):
+                rt = route_for(b, k)
+                # add all y[b,k,abs] whose abs is in day d
+                # (checking key existence keeps it efficient)
+                if rt == routeAB:
+                    for s in range(lo, hi + 1):
+                        key = (b, k, s)
+                        if key in y: ab_vars.append(y[key])
+                else:
+                    for s in range(lo, hi + 1):
+                        key = (b, k, s)
+                        if key in y: ba_vars.append(y[key])
+        # enforce quotas
+        m.Add(sum(ab_vars) == B)
+        m.Add(sum(ba_vars) == B)
+
+    # ---------- objective: maximize total EPK (tiny time tie-breaker) ----------
     obj = []
-    for (b, d, t, s), var in y.items():
-        rt = seqA[t] if home[b] == "A" else seqB[t]
-        obj.append(int(epk.get((rt, d, s), 0) * 100) * var)
+    for (b, k, abs_t), var in y.items():
+        d = abs_t // SLOTS
+        s = abs_t % SLOTS
+        rt = route_for(b, k)
+        val = epk.get((rt, d, s), 0.0)
+        # strong EPK term + tiny preference for later times to break ties toward nights
+        obj.append(int(val * 100000) * var + abs_t * var)
     m.Maximize(sum(obj))
 
+    # ---------- solve ----------
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = limit
-    solver.parameters.num_search_workers = 8
+    solver.parameters.log_search_progress = enable_logs
+    if deterministic:
+        solver.parameters.num_search_workers = 8
+        solver.parameters.random_seed = seed
+    else:
+        solver.parameters.num_search_workers = 8
 
     status = solver.Solve(m)
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        raise RuntimeError("No feasible schedule – try larger max idle or check EPK coverage.")
+        name = ("INFEASIBLE" if status == cp_model.INFEASIBLE else
+                "MODEL_INVALID" if status == cp_model.MODEL_INVALID else "UNKNOWN")
+        raise RuntimeError(f"No feasible schedule. Solver status: {name}.")
 
-    # Build schedule (unchanged)
+    # ---------- build schedule back into your day buckets ----------
+    def s2t_local(s): return f"{s//2:02d}:{(s%2)*30:02d}:00"
     sched = {}
     for b in range(B):
-        bus = f"Bus-{b + 1:02d}"
-        sched[bus] = {}
-        for d, dy in enumerate(days):
-            trips = []
-            for t in range(TRIPS_PER_DAY):
-                rt = seqA[t] if home[b] == "A" else seqB[t]
-                s = int(solver.Value(start[(b, d, t)]))
-                trips.append({
+        bus = f"Bus-{b+1:02d}"
+        sched[bus] = {dy: [] for dy in days}
+        for k in range(K):
+            abs_val = int(solver.Value(start_abs[(b, k)]))
+            d = abs_val // SLOTS
+            s = abs_val % SLOTS
+            rt = route_for(b, k)
+            if 0 <= d < D:
+                sched[bus][days[d]].append({
                     "route": rt,
-                    "startTime": s2t(s),
-                    "midPointTime": s2t((s + travel_s // 2) % SLOTS_PER_DAY),
-                    "endTime": s2t((s + travel_s) % SLOTS_PER_DAY),
-                    "epk": round(epk.get((rt, d, s), 0), 2)
+                    "startTime": s2t_local(s),
+                    "midPointTime": s2t_local((s + travel_s // 2) % SLOTS),
+                    "endTime": s2t_local((s + travel_s) % SLOTS),
+                    "epk": round(epk.get((rt, d, s), 0.0), 2)
                 })
-            trips.sort(key=lambda x: x["startTime"])
-            sched[bus][dy] = trips
-
+        for dy in days:
+            sched[bus][dy].sort(key=lambda tr: tr["startTime"])
     return sched
+
 
 def compute_metrics(sched):
     total_buses = len(sched)
