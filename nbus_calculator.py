@@ -71,125 +71,74 @@ def load_corridor(csv_path: Path,
 # OR-Tools model for one corridor and one (nA, nB) combination
 # route-wise avg floor is optional (pass None to disable)
 # ─────────────────────────────────────────────────────────────
-def solve_corridor(epk_map: Dict[Tuple[str,str,int], float],
-                   day_labels: List[str],
-                   route_fwd: str, route_rev: str,
-                   travel_h: float, charge_h: float,
-                   n_origin: int, n_dest: int,
-                   min_gap_slots: int = DEFAULT_MIN_GAP,
-                   time_limit: int = TIME_LIMIT_SEC,
-                   route_thresholds: Optional[Dict[str, float]] = None
-                  ) -> Tuple[int, float, List[Tuple[int,str]]]:
-    """Aggregate corridor flow (no per-bus variables).
-       Enforces forbidden window, spacing, flow with travel+charge,
-       and optional route-wise average EPK floors.
+def solve_corridor(
+    epk_map: Dict[Tuple[str,str,int], float],
+    day_labels: List[str],
+    route_fwd: str, route_rev: str,
+    travel_h: float, charge_h: float,
+    n_origin: int, n_dest: int,
+    idle_h: float = 4.0,                 # NEW: to match per-bus model's max extra idle
+    time_limit: int = TIME_LIMIT_SEC,
+    deterministic: bool = True,
+    seed: int = 123,
+    enable_logs: bool = False,
+) -> Tuple[int, float, List[Tuple[int,str]]]:
     """
-    travel_slots = int(round(travel_h * 2))
-    charge_slots = int(round(charge_h * 2))
-    total_fwd = travel_slots + charge_slots
-    total_rev = travel_slots + charge_slots
-
+    Wraps the per-bus CP-SAT `solve(...)` (month horizon, daily quotas).
+    Returns (trips, avg_epk, chosen) where chosen is [(abs_t, route_str)].
+    """
+    # --- Remap EPK to the per-bus solver's keying: (route, day_index, slot)
+    # day_labels are strings "1","2",...; solver wants day index 0..D-1
     D = len(day_labels)
-    T = D * SLOTS_PER_DAY
-    def slot_of(t): return t % SLOTS_PER_DAY
-    def day_of(t):  return day_labels[t // SLOTS_PER_DAY]
+    day_to_idx = {d:i for i,d in enumerate(day_labels)}
+    epk_indexed: Dict[Tuple[str,int,int], float] = {}
 
-    m = cp_model.CpModel()
-    Y = {}
+    for d_lbl, d_idx in day_to_idx.items():
+        for s in ALLOWED:
+            # default to 0.0 if missing in csv (solver objective can handle zeros)
+            epk_indexed[(route_fwd, d_idx, s)] = float(epk_map.get((route_fwd, d_lbl, s), 0.0))
+            epk_indexed[(route_rev, d_idx, s)] = float(epk_map.get((route_rev, d_lbl, s), 0.0))
 
-    # decision vars: departures only where EPK exists and not forbidden
-    for t in range(T):
-        s = slot_of(t)
-        if s in FORBIDDEN_SLOTS:
-            continue
-        for r in (route_fwd, route_rev):
-            key = (r, day_of(t), s)
-            if key in epk_map:
-                Y[(r,t)] = m.NewBoolVar(f"D_{r.replace('-','')}_{t}")
+    # --- Call your per-bus solver
+    travel_s = int(round(travel_h * 2))
+    charge_s = int(round(charge_h * 2))
+    idle_s   = int(round(idle_h   * 2))
 
-    # inventories at origin/dest
-    fleet = n_origin + n_dest
-    I_o = [m.NewIntVar(0, fleet, f"Io_{tt}") for tt in range(T+1)]
-    I_d = [m.NewIntVar(0, fleet, f"Id_{tt}") for tt in range(T+1)]
-    m.Add(I_o[0] == n_origin)
-    m.Add(I_d[0] == n_dest)
+    sched = solve(
+        epk=epk_indexed,
+        days=day_labels,           # labels are used only to name buckets in output
+        routeAB=route_fwd,
+        routeBA=route_rev,
+        busesA=n_origin,
+        busesB=n_dest,
+        travel_s=travel_s,
+        charge_s=charge_s,
+        idle_s=idle_s,
+        limit=time_limit,
+        deterministic=deterministic,
+        seed=seed,
+        enable_logs=enable_logs
+    )
 
-    # flow with travel+charge delay
-    for t in range(T):
-        dep_o = [Y[(route_fwd,t)]] if (route_fwd,t) in Y else []
-        dep_d = [Y[(route_rev,t)]] if (route_rev,t) in Y else []
-
-        arr_o, arr_d = [], []
-        tt = t - total_rev
-        if tt >= 0 and (route_rev,tt) in Y: arr_o.append(Y[(route_rev,tt)])
-        tt = t - total_fwd
-        if tt >= 0 and (route_fwd,tt) in Y: arr_d.append(Y[(route_fwd,tt)])
-
-        m.Add(I_o[t+1] == I_o[t] - sum(dep_o) + sum(arr_o))
-        m.Add(I_d[t+1] == I_d[t] - sum(dep_d) + sum(arr_d))
-
-    # spacing at each station
-    for t in range(T):
-        # origin → route_fwd
-        if (route_fwd,t) in Y: m.Add(Y[(route_fwd,t)] <= 1)
-        for g in range(1, min_gap_slots):
-            t2 = t + g
-            if t2 >= T: break
-            pack = []
-            if (route_fwd,t)  in Y: pack.append(Y[(route_fwd,t)])
-            if (route_fwd,t2) in Y: pack.append(Y[(route_fwd,t2)])
-            if pack: m.Add(sum(pack) <= 1)
-        # dest → route_rev
-        if (route_rev,t) in Y: m.Add(Y[(route_rev,t)] <= 1)
-        for g in range(1, min_gap_slots):
-            t2 = t + g
-            if t2 >= T: break
-            pack = []
-            if (route_rev,t)  in Y: pack.append(Y[(route_rev,t)])
-            if (route_rev,t2) in Y: pack.append(Y[(route_rev,t2)])
-            if pack: m.Add(sum(pack) <= 1)
-
-    # objective + optional route-wise average floors
-    count_terms, epk_terms, lhs_terms = [], [], []
-    for (r,t), var in Y.items():
-        s = slot_of(t)
-        epk_val = epk_map[(r, day_of(t), s)]
-        ei = int(round(epk_val * 100))
-        count_terms.append(var)
-        epk_terms.append(ei * var)
-        if route_thresholds:
-            thr = route_thresholds.get(r, -1e9)
-            ti  = int(round(thr * 100))
-            lhs_terms.append((ei - ti) * var)
-
-    if route_thresholds and lhs_terms:
-        # sum((epk - thr_r) * y) >= 0 → route-wise average floors
-        m.Add(sum(lhs_terms) >= 0)
-
-    # maximize trips, tie-break by total EPK
-    m.Maximize(100000 * sum(count_terms) + sum(epk_terms))
-
-    s = cp_model.CpSolver()
-    s.parameters.max_time_in_seconds = time_limit
-    s.parameters.num_search_workers  = 8
-    status = s.Solve(m)
-    
-    # Always return 3 values
-    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        return 0, 0.0, []
-
-    chosen = [(t,r) for (r,t) in Y if s.Value(Y[(r,t)]) == 1]
-    chosen.sort(key=lambda x: x[0])
-    trips = len(chosen)
-    if trips == 0:
-        return 0, 0.0, []
-
+    # --- Aggregate metrics to match old return type
+    SLOTS = SLOTS_PER_DAY
+    trips = 0
     total_epk = 0.0
-    for (t,r) in chosen:
-        sidx = slot_of(t)
-        total_epk += epk_map[(r, day_of(t), sidx)]
-    avg_epk = total_epk / trips
+    chosen: List[Tuple[int,str]] = []  # (abs_t, route)
+
+    for bus, by_day in sched.items():
+        for d_idx, d_lbl in enumerate(day_labels):
+            for tr in by_day.get(d_lbl, []):
+                trips += 1
+                total_epk += float(tr["epk"])
+                s = slot_to_idx(tr["startTime"])    # "HH:MM:SS" -> slot
+                abs_t = d_idx * SLOTS + s
+                chosen.append((abs_t, tr["route"]))
+
+    chosen.sort(key=lambda x: x[0])
+    avg_epk = (total_epk / trips) if trips > 0 else 0.0
     return trips, avg_epk, chosen
+
 
 # ─────────────────────────────────────────────────────────────
 # Heatmap & HTML
