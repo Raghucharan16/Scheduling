@@ -8,14 +8,14 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from ortools.sat.python import cp_model
-from epk_avg_per_route import get_avg_epk_per_route
+from epk_avg_as_threshold_per_route import get_avg_epk_per_route
 # ─────────────────────────────────────────────────────────────
 # Global time grid & ops rules
 # ─────────────────────────────────────────────────────────────
 SLOTS_PER_DAY   = 48                  # 30-minute slots
 FORBIDDEN_SLOTS = {1,2,3,4,5,6}       # 00:30–03:00 forbidden for departures
 DEFAULT_MIN_GAP = 1                   # station spacing in slots (30 min per slot)
-TIME_LIMIT_SEC  = 120                 # per-solve time
+TIME_LIMIT_SEC  = 300                 # per-solve time
 
 # ─────────────────────────────────────────────────────────────
 # Helpers
@@ -24,7 +24,14 @@ def slot_to_idx(s: str) -> int:
     s = s.strip()
     if s == "23:50:00":
         return 0
-    hh, mm, _ = s.split(":")
+    # Handle both HH:MM and HH:MM:SS formats
+    parts = s.split(":")
+    if len(parts) == 2:  # HH:MM format
+        hh, mm = parts
+    elif len(parts) == 3:  # HH:MM:SS format
+        hh, mm, _ = parts
+    else:
+        raise ValueError(f"Invalid time format: {s}")
     return int(hh)*2 + (int(mm)//30)
 
 def idx_to_hhmm(idx: int) -> str:
@@ -166,6 +173,8 @@ def solve_corridor(epk_map: Dict[Tuple[str,str,int], float],
     s.parameters.max_time_in_seconds = time_limit
     s.parameters.num_search_workers  = 8
     status = s.Solve(m)
+    
+    # Always return 3 values
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         return 0, 0.0, []
 
@@ -280,7 +289,7 @@ def ask_text(msg, default): v=input(f"{msg} [{default}]: ").strip(); return v if
 # ─────────────────────────────────────────────────────────────
 def main():
     print("Electric Bus Corridor — EPK Heatmap\n")
-    csv_path   = ask_path("Month CSV path", "cache/h_v_epk_data.csv")
+    csv_path   = ask_path("Month CSV path", "cache/vskp-vjy_aug_neugo_epk_data.csv")
     route_fwd  = ask_text("Forward route code", "H-V")
     route_rev  = ask_text("Reverse route code", "V-H")
     travel_h   = ask_float("Travel hours (one way, same both directions)", 9.0)
