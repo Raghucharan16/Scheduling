@@ -6,7 +6,8 @@ from datetime import datetime, date, timedelta
 from math import inf
 from dotenv import load_dotenv
 # CONFIG
-TIME_WINDOW_MIN = 30         # ± minutes threshold (set very large for experimentation)
+TIME_WINDOW_MIN = 60         # ± minutes threshold (set very large for experimentation)
+BUFFER_MINUTES = 30          # Buffer for "close match" comparison
 UTC_OFFSET_MIN = 330          # TripBoardingPoints stored UTC -> convert to IST for comparison
 METRICS_OUT = "service_mappings_may_metrics.csv"
 load_dotenv()
@@ -14,10 +15,20 @@ load_dotenv()
 ROUTE_CODE_MAP = {
     "H-V":  (3, 5),
     "V-H":  (5, 3),
-    "Vij-Vsk": (4, 6),   # adjust IDs if needed
-    "Vsk-Vij": (6, 4),
-    "B-T": (7, 8),
-    "T-B": (8, 7),
+    "Vij-Vsk": (5, 58),   # adjust IDs if needed
+    "Vsk-Vij": (58, 5),
+    "B-T": (7, 12),
+    "T-B": (12, 7),
+}
+
+# Route name mapping for existing schedule data
+ROUTE_NAME_MAP = {
+    "BANGALORE": "B",
+    "TIRUPATI": "T", 
+    "HYDERABAD": "H",
+    "VIJAYAWADA": "V",
+    "VISAKHAPATNAM": "Vsk",
+    "MYSORE": "M"
 }
 
 def get_conn():
@@ -38,6 +49,55 @@ def parse_hms(tstr: str):
     if len(tstr.split(":")) == 2:  # HH:MM
         tstr = tstr + ":00"
     return datetime.strptime(tstr, "%H:%M:%S").time()
+
+def parse_existing_schedule(existing_data_str):
+    """
+    Parse the existing schedule data string into structured format.
+    Returns list of dicts with route_code and schedule_time.
+    """
+    existing_trips = []
+    # Split by | and process in groups of 4 (source, destination, bus_id, time)
+    parts = [p.strip() for p in existing_data_str.split("|")]
+    
+    for i in range(0, len(parts), 4):
+        if i + 3 < len(parts):
+            source = parts[i].strip()
+            destination = parts[i + 1].strip()
+            bus_id = parts[i + 2].strip()
+            time_str = parts[i + 3].strip()
+            
+            # Convert route names to route codes
+            source_code = ROUTE_NAME_MAP.get(source)
+            dest_code = ROUTE_NAME_MAP.get(destination)
+            
+            if source_code and dest_code:
+                route_code = f"{source_code}-{dest_code}"
+                try:
+                    schedule_time = parse_hms(time_str)
+                    existing_trips.append({
+                        "route_code": route_code,
+                        "schedule_time": schedule_time,
+                        "bus_id": bus_id,
+                        "source": source,
+                        "destination": destination
+                    })
+                except ValueError:
+                    continue  # Skip invalid time formats
+    
+    return existing_trips
+
+def time_difference_minutes(time1, time2):
+    """Calculate difference between two time objects in minutes."""
+    dt1 = datetime.combine(date.today(), time1)
+    dt2 = datetime.combine(date.today(), time2)
+    
+    # Handle times that cross midnight
+    if time1 < time2 and (time2.hour - time1.hour) > 12:
+        dt1 += timedelta(days=1)
+    elif time2 < time1 and (time1.hour - time2.hour) > 12:
+        dt2 += timedelta(days=1)
+    
+    return abs((dt1 - dt2).total_seconds() / 60.0)
 
 def fetch_trips(start_date: date, end_date: date, needed_route_codes):
     """
@@ -303,51 +363,127 @@ def run_matching(schedule_legs, trips):
 
     return metrics_rows
 
+def compare_schedules(json_schedule_legs, existing_schedule_trips):
+    """
+    Compare JSON schedule with existing schedule and return the three metrics:
+    1. Exact matches (same route, same time)
+    2. Buffer matches (same route, within 30 minutes)  
+    3. New trips (not matching existing at all)
+    """
+    
+    # Group existing trips by route for faster lookup
+    existing_by_route = {}
+    for trip in existing_schedule_trips:
+        route = trip["route_code"]
+        if route not in existing_by_route:
+            existing_by_route[route] = []
+        existing_by_route[route].append(trip)
+    
+    # Flatten JSON schedule legs to just route and time (ignore dates for comparison)
+    json_trips = []
+    for leg in json_schedule_legs:
+        json_trips.append({
+            "route_code": leg["route_code"],
+            "schedule_time": leg["schedule_time"]
+        })
+    
+    exact_matches = 0
+    buffer_matches = 0
+    new_trips = 0
+    
+    for json_trip in json_trips:
+        route_code = json_trip["route_code"]
+        json_time = json_trip["schedule_time"]
+        
+        # Check if route exists in existing schedule
+        if route_code not in existing_by_route:
+            new_trips += 1
+            continue
+            
+        existing_trips_for_route = existing_by_route[route_code]
+        
+        # Check for exact match first
+        exact_match_found = False
+        for existing_trip in existing_trips_for_route:
+            if json_time == existing_trip["schedule_time"]:
+                exact_matches += 1
+                exact_match_found = True
+                break
+        
+        if exact_match_found:
+            continue
+            
+        # Check for buffer match (within 30 minutes)
+        buffer_match_found = False
+        for existing_trip in existing_trips_for_route:
+            time_diff = time_difference_minutes(json_time, existing_trip["schedule_time"])
+            if time_diff <= BUFFER_MINUTES:
+                buffer_matches += 1
+                buffer_match_found = True
+                break
+                
+        if not buffer_match_found:
+            new_trips += 1
+    
+    total_json_trips = len(json_trips)
+    
+    results = {
+        "total_json_trips": total_json_trips,
+        "exact_matches": exact_matches,
+        "buffer_matches": buffer_matches, 
+        "new_trips": new_trips,
+        "exact_match_percentage": round((exact_matches / total_json_trips * 100), 2) if total_json_trips > 0 else 0,
+        "buffer_match_percentage": round((buffer_matches / total_json_trips * 100), 2) if total_json_trips > 0 else 0,
+        "new_trips_percentage": round((new_trips / total_json_trips * 100), 2) if total_json_trips > 0 else 0
+    }
+    
+    return results
+
 def main():
     # Inputs
-    schedule_json = "C:/Users/Raghu/Downloads/hv-schedule.json"
-    base_day1_date = date(2025, 5, 1)
-    start_date = base_day1_date
-    end_date = date(2025, 5, 31)
+    schedule_json = "cache/hv-oct-refer.json"
+    base_day1_date = date(2025, 9, 1)
+    
+    # Existing schedule data (provided by user)
+    existing_schedule_data = """BANGALORE |TIRUPATI | 67|10:00 | BANGALORE |TIRUPATI | 8|12:00 | BANGALORE |TIRUPATI | 14|14:00 | BANGALORE |TIRUPATI | 35|17:00 | BANGALORE |TIRUPATI | 19|19:30 | BANGALORE |TIRUPATI | 22|20:30 | BANGALORE |TIRUPATI | 103|21:30 | BANGALORE |TIRUPATI | 9|22:20 | BANGALORE |TIRUPATI | 31|23:30 | BANGALORE |TIRUPATI | 68|5:00 | BANGALORE |TIRUPATI | 75|5:30 | BANGALORE |TIRUPATI | 36|6:00 | BANGALORE |TIRUPATI | 29|7:00 | HYDERABAD |VIJAYAWADA | 40|10:30 | HYDERABAD |VIJAYAWADA | 99|15:00 | HYDERABAD |VIJAYAWADA | 48|16:00 | HYDERABAD |VIJAYAWADA | 123|20:15 | HYDERABAD |VIJAYAWADA | 58|21:00 | HYDERABAD |VIJAYAWADA | 61|21:45 | HYDERABAD |VIJAYAWADA | 37|22:45 | HYDERABAD |VIJAYAWADA | 38|23:10 | HYDERABAD |VIJAYAWADA | 55|3:35 | HYDERABAD |VIJAYAWADA | 47|4:50 | HYDERABAD |VIJAYAWADA | 119|6:00 | HYDERABAD |VIJAYAWADA | 39|7:30 | HYDERABAD |VIJAYAWADA | 76|8:30 | HYDERABAD |VIJAYAWADA | 49|9:30 | MYSORE |BANGALORE | 127|17:00 | MYSORE |BANGALORE | 126|18:30 | MYSORE |BANGALORE | 131|19:30 | TIRUPATI |BANGALORE | 97|10:30 | TIRUPATI |BANGALORE | 10|11:30 | TIRUPATI |BANGALORE | 6|14:00 | TIRUPATI |BANGALORE | 34|16:00 | TIRUPATI |BANGALORE | 54|17:00 | TIRUPATI |BANGALORE | 102|18:00 | TIRUPATI |BANGALORE | 89|20:30 | TIRUPATI |BANGALORE | 21|22:00 | TIRUPATI |BANGALORE | 7|22:50 | TIRUPATI |BANGALORE | 13|23:50 | TIRUPATI |BANGALORE | 33|5:30 | TIRUPATI |BANGALORE | 90|6:30 | TIRUPATI |BANGALORE | 3|8:00 | VIJAYAWADA |HYDERABAD | 60|10:00 | VIJAYAWADA |HYDERABAD | 53|10:40 | VIJAYAWADA |HYDERABAD | 100|11:40 | VIJAYAWADA |HYDERABAD | 50|15:00 | VIJAYAWADA |HYDERABAD | 51|16:00 | VIJAYAWADA |HYDERABAD | 112|17:00 | VIJAYAWADA |HYDERABAD | 57|20:00 | VIJAYAWADA |HYDERABAD | 43|20:50 | VIJAYAWADA |HYDERABAD | 44|22:10 | VIJAYAWADA |HYDERABAD | 52|23:00 | VIJAYAWADA |HYDERABAD | 41|4:10 | VIJAYAWADA |HYDERABAD | 104|5:00 | VIJAYAWADA |HYDERABAD | 42|8:00 | VIJAYAWADA |HYDERABAD | 59|9:00 | VIJAYAWADA |VISAKHAPATNAM| 403|10:00 | VIJAYAWADA |VISAKHAPATNAM| 412|17:30 | VIJAYAWADA |VISAKHAPATNAM| 404|19:30 | VIJAYAWADA |VISAKHAPATNAM| 401|20:30 | VIJAYAWADA |VISAKHAPATNAM| 402|21:30 | VIJAYAWADA |VISAKHAPATNAM| 411|9:00 | VISAKHAPATNAM|VIJAYAWADA | 408|10:00 | VISAKHAPATNAM|VIJAYAWADA | 414|19:30 | VISAKHAPATNAM|VIJAYAWADA | 409|20:30 | VISAKHAPATNAM|VIJAYAWADA | 410|21:30 | VISAKHAPATNAM|VIJAYAWADA | 407|22:30"""
 
+    # Load JSON schedule
     schedule = load_schedule(schedule_json)
     schedule_legs = expand_schedule(schedule, base_day1_date)
-    needed_route_codes = sorted({leg["route_code"] for leg in schedule_legs})
-
-    print(f"Schedule legs loaded: {len(schedule_legs)} over {len(needed_route_codes)} route codes")
-
-    trips = fetch_trips(start_date, end_date, needed_route_codes)
-    print(f"Trips fetched: {len(trips)}")
-
-    metrics_rows = run_matching(schedule_legs, trips)
-
-    metrics_df = pd.DataFrame(metrics_rows).sort_values(["date","route_code"])
-    metrics_df.to_csv(METRICS_OUT, index=False)
-
-    # Overall summary (vs schedule only)
-    total_sched = metrics_df["scheduled_legs"].sum()
-    total_trips = metrics_df["trips_db"].sum()
-    total_matched = metrics_df["matched_legs"].sum()
-    overall_ratio_sched = round((total_matched / total_sched * 100), 2) if total_sched else 0.0
-    overall_ratio_trips = round((total_matched / total_trips * 100), 2) if total_trips else 0.0
-
-    print("Per-day metrics saved to", METRICS_OUT)
-    print(f"Window (minutes): {TIME_WINDOW_MIN}")
-    print(f"Overall scheduled legs: {total_sched}")
-    print(f"Overall trips in DB: {total_trips}")
-    print(f"Overall matched legs: {total_matched}")
-    print(f"Overall match ratio vs schedule: {overall_ratio_sched}%")
-    print(f"Overall match ratio vs trips: {overall_ratio_trips}%")
-    # Helpful diagnostics to explain non-100% with huge window
-    remaining_due_to_shortage = metrics_df['scheduled_minus_trips'].sum()
-    remaining_outside_window = metrics_df['legs_closest_outside_window'].sum()
-    no_trip_days = metrics_df['legs_no_trips'].sum()
-    if remaining_due_to_shortage:
-        print(f"Unmatched (schedule exceeds trips): {remaining_due_to_shortage}")
-    if remaining_outside_window:
-        print(f"Unmatched (even closest diff > window): {remaining_outside_window}")
-    if no_trip_days:
-        print(f"Schedule legs on days with zero trips: {no_trip_days}")
+    
+    # Parse existing schedule
+    existing_trips = parse_existing_schedule(existing_schedule_data)
+    
+    print(f"JSON Schedule legs loaded: {len(schedule_legs)}")
+    print(f"Existing schedule trips loaded: {len(existing_trips)}")
+    
+    # Get unique route codes from both schedules
+    json_routes = sorted({leg["route_code"] for leg in schedule_legs})
+    existing_routes = sorted({trip["route_code"] for trip in existing_trips})
+    
+    print(f"JSON schedule routes: {json_routes}")
+    print(f"Existing schedule routes: {existing_routes}")
+    
+    # Compare schedules
+    comparison_results = compare_schedules(schedule_legs, existing_trips)
+    
+    print("\n" + "="*60)
+    print("SCHEDULE COMPARISON RESULTS")
+    print("="*60)
+    print(f"Total trips in JSON schedule: {comparison_results['total_json_trips']}")
+    print(f"Buffer window for matching: {BUFFER_MINUTES} minutes")
+    print()
+    print(f"1. EXACT MATCHES: {comparison_results['exact_matches']} ({comparison_results['exact_match_percentage']}%)")
+    print(f"   - Same route, same time")
+    print()
+    print(f"2. BUFFER MATCHES: {comparison_results['buffer_matches']} ({comparison_results['buffer_match_percentage']}%)")
+    print(f"   - Same route, within {BUFFER_MINUTES} minutes difference")
+    print()
+    print(f"3. NEW TRIPS: {comparison_results['new_trips']} ({comparison_results['new_trips_percentage']}%)")
+    print(f"   - Not matching existing schedule (new routes or >30min difference)")
+    print()
+    print(f"TOTAL VERIFIED: {comparison_results['exact_matches'] + comparison_results['buffer_matches'] + comparison_results['new_trips']} trips")
+    print("="*60)
 
 if __name__ == "__main__":
     main()
